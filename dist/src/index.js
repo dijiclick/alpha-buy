@@ -4,12 +4,11 @@ import { State } from './state.js';
 import { getDb } from './db/supabase.js';
 import { backfill } from './ingestion/backfill.js';
 import { startEventSyncer } from './ingestion/syncer.js';
-import { startPriceUpdater } from './ingestion/price-updater.js';
-import { startTier0Detector } from './detection/tier0-price.js';
+import { startResolutionAgent } from './detection/agent.js';
 const log = createLogger('main');
 async function main() {
     log.info('Alpha Scanner starting...');
-    log.info(`Config: watchlist=${config.PRICE_WATCHLIST}, trigger=${config.PRICE_TRIGGER}`);
+    log.info(`Config: trigger=${config.PRICE_TRIGGER}, confidence=${config.MIN_CONFIDENCE}`);
     if (process.env.LOG_LEVEL)
         setLogLevel(process.env.LOG_LEVEL);
     // Verify DB connection
@@ -32,20 +31,18 @@ async function main() {
     }
     // Phase 2: Start polling loops
     startEventSyncer(state);
-    startTier0Detector(state);
-    startPriceUpdater(state);
-    // Phase 3: Periodic state persistence
+    // Phase 3: Start resolution agent
+    startResolutionAgent(state);
+    // Phase 4: Periodic state persistence
     setInterval(() => state.persist(), config.STATE_PERSIST_INTERVAL);
-    // Phase 4: Status reporting
+    // Phase 5: Status reporting
     setInterval(() => {
         const s = state.stats();
-        const hot = [...state.hotMarkets.values()];
-        const actionable = hot.filter(h => h.isActionable);
-        log.info(`STATUS: events=${s.events} markets=${s.markets} hot=${s.hotMarkets} actionable=${actionable.length}`);
-        if (hot.length > 0) {
-            for (const h of hot) {
-                const age = Math.floor((Date.now() - h.detectedAt) / 1000);
-                log.info(`  HOT: ${h.question.slice(0, 80)} → ${h.detectedOutcome} (${h.confidence}%) price=$${h.currentPrice.toFixed(3)} profit=${h.profitPct.toFixed(1)}% age=${age}s actionable=${h.isActionable}`);
+        log.info(`STATUS: events=${s.events} markets=${s.markets} tracked=${s.tracked}`);
+        if (state.trackedMarkets.size > 0) {
+            for (const [, t] of state.trackedMarkets) {
+                const next = t.nextCheckAt ? new Date(t.nextCheckAt).toISOString() : 'unknown';
+                log.info(`  TRACKING: "${t.question.slice(0, 70)}" checks=${t.checkCount} next=${next}`);
             }
         }
     }, config.STATUS_REPORT_INTERVAL);

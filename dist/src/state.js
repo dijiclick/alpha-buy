@@ -3,7 +3,7 @@ import { createLogger } from './util/logger.js';
 const log = createLogger('state');
 const STATE_FILE = 'state.json';
 export class State {
-    hotMarkets = new Map();
+    trackedMarkets = new Map(); // marketId → { question, estimatedEnd, lastChecked, checkCount, nextCheckAt }
     knownEventIds = new Set();
     knownMarketIds = new Set();
     marketsByQuestion = new Map(); // normalizedQuestion → marketId
@@ -23,7 +23,9 @@ export class State {
                 this.knownMarketIds.add(id);
             for (const [q, id] of data.marketsByQuestion || [])
                 this.marketsByQuestion.set(q, id);
-            log.info(`State loaded: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets, backfill=${this.backfillComplete}`);
+            for (const [id, entry] of data.trackedMarkets || [])
+                this.trackedMarkets.set(id, entry);
+            log.info(`State loaded: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets, ${this.trackedMarkets.size} tracked, backfill=${this.backfillComplete}`);
         }
         catch (e) {
             log.error('Failed to load state.json', e.message);
@@ -36,9 +38,10 @@ export class State {
                 knownEventIds: [...this.knownEventIds],
                 knownMarketIds: [...this.knownMarketIds],
                 marketsByQuestion: [...this.marketsByQuestion.entries()],
+                trackedMarkets: [...this.trackedMarkets.entries()],
             };
             writeFileSync(STATE_FILE, JSON.stringify(data));
-            log.debug(`State persisted: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets`);
+            log.debug(`State persisted: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets, ${this.trackedMarkets.size} tracked`);
         }
         catch (e) {
             log.error('Failed to persist state', e.message);
@@ -48,7 +51,7 @@ export class State {
         return {
             events: this.knownEventIds.size,
             markets: this.knownMarketIds.size,
-            hotMarkets: this.hotMarkets.size,
+            tracked: this.trackedMarkets.size,
         };
     }
 }
