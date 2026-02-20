@@ -156,6 +156,114 @@ export async function closeStaleEvents(activeGammaIds) {
     log.info(`Closed ${staleIds.length} stale events (no longer active on Polymarket)`);
     return staleIds.length;
 }
+export async function getHighPriceEvents(threshold) {
+    const db = getDb();
+    // Get markets where price indicates a likely outcome (≥ threshold)
+    const results = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+        const { data, error } = await db
+            .from('markets')
+            .select('event_id')
+            .eq('active', true)
+            .eq('closed', false)
+            .or(`best_ask.gte.${threshold},last_trade_price.gte.${threshold}`)
+            .range(from, from + pageSize - 1);
+        if (error) {
+            log.error('getHighPriceEvents failed', error.message);
+            break;
+        }
+        if (!data || data.length === 0) break;
+        results.push(...data);
+        if (data.length < pageSize) break;
+        from += pageSize;
+    }
+    // Get unique event IDs
+    const eventIds = [...new Set(results.map(r => r.event_id))];
+    if (eventIds.length === 0) return [];
+    // Fetch those events with their markets
+    const events = [];
+    // Supabase .in() has practical limits, batch if needed
+    const batchSize = 100;
+    for (let i = 0; i < eventIds.length; i += batchSize) {
+        const batch = eventIds.slice(i, i + batchSize);
+        const { data, error } = await db
+            .from('events')
+            .select('*, markets(*)')
+            .in('id', batch)
+            .eq('active', true)
+            .eq('closed', false);
+        if (error) {
+            log.error('getHighPriceEvents (events) failed', error.message);
+            continue;
+        }
+        if (data) events.push(...data);
+    }
+    return events
+        .map(event => ({
+            ...event,
+            markets: (event.markets || []).filter(m => m.active && !m.closed),
+        }))
+        .filter(event => event.markets.length > 0);
+}
+export async function getEventByMarketTokenId(tokenId) {
+    const db = getDb();
+    // Find market containing this token ID, return its event with all markets
+    const { data: markets } = await db
+        .from('markets')
+        .select('event_id, clob_token_ids')
+        .eq('active', true)
+        .eq('closed', false);
+    if (!markets) return null;
+    const market = markets.find(m => {
+        const ids = typeof m.clob_token_ids === 'string'
+            ? JSON.parse(m.clob_token_ids) : m.clob_token_ids;
+        return ids && ids.includes(tokenId);
+    });
+    if (!market) return null;
+    const { data: event } = await db
+        .from('events')
+        .select('*, markets(*)')
+        .eq('id', market.event_id)
+        .single();
+    if (!event) return null;
+    return {
+        ...event,
+        markets: (event.markets || []).filter(m => m.active && !m.closed),
+    };
+}
+export async function getAllActiveTokenIds() {
+    const db = getDb();
+    const results = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+        const { data, error } = await db
+            .from('markets')
+            .select('clob_token_ids')
+            .eq('active', true)
+            .eq('closed', false)
+            .not('clob_token_ids', 'is', null)
+            .range(from, from + pageSize - 1);
+        if (error) {
+            log.error('getAllActiveTokenIds failed', error.message);
+            break;
+        }
+        if (!data || data.length === 0) break;
+        for (const row of data) {
+            const ids = typeof row.clob_token_ids === 'string'
+                ? JSON.parse(row.clob_token_ids) : row.clob_token_ids;
+            if (Array.isArray(ids)) {
+                // Only push YES token (index 0) — that's what we watch for spikes
+                if (ids[0]) results.push(ids[0]);
+            }
+        }
+        if (data.length < pageSize) break;
+        from += pageSize;
+    }
+    return results;
+}
 export async function getActiveMarkets() {
     const db = getDb();
     const results = [];

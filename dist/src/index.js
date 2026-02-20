@@ -5,6 +5,7 @@ import { getDb } from './db/supabase.js';
 import { backfill } from './ingestion/backfill.js';
 import { startEventSyncer } from './ingestion/syncer.js';
 import { startResolutionAgent } from './detection/agent.js';
+import { startPriceStream, stopPriceStream } from './detection/websocket.js';
 const log = createLogger('main');
 async function main() {
     log.info('Alpha Scanner starting...');
@@ -33,6 +34,8 @@ async function main() {
     startEventSyncer(state);
     // Phase 3: Start resolution agent
     startResolutionAgent(state);
+    // Phase 3b: Start real-time price stream (WebSocket)
+    startPriceStream(state);
     // Phase 4: Periodic state persistence
     setInterval(() => state.persist(), config.STATE_PERSIST_INTERVAL);
     // Phase 5: Status reporting
@@ -49,6 +52,7 @@ async function main() {
     // Graceful shutdown
     const shutdown = () => {
         log.info('Shutting down...');
+        stopPriceStream();
         state.persist();
         process.exit(0);
     };

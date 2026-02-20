@@ -12,11 +12,9 @@ function optEnv(key) {
 }
 function getPerplexityTokens() {
     const tokens = [];
-    // Primary token (required)
     const primary = process.env.PERPLEXITY_SESSION_TOKEN;
     if (!primary) throw new Error('Missing env: PERPLEXITY_SESSION_TOKEN');
     tokens.push(primary);
-    // Additional tokens: PERPLEXITY_SESSION_TOKEN_2, _3, etc.
     for (let i = 2; i <= 10; i++) {
         const t = process.env[`PERPLEXITY_SESSION_TOKEN_${i}`];
         if (t) tokens.push(t);
@@ -41,12 +39,14 @@ export const config = {
     TELEGRAM_CHAT_ID: optEnv('TELEGRAM_CHAT_ID'),
     // CLOB API
     CLOB_BASE: 'https://clob.polymarket.com',
+    CLOB_WS: 'wss://ws-subscriptions-clob.polymarket.com/ws/market',
     // API bases
     GAMMA_BASE: 'https://gamma-api.polymarket.com',
     // Tag IDs
     CRYPTO_TAG_ID: 21,
     // Thresholds
     MIN_CONFIDENCE: 80,
+    PRICE_SPIKE_THRESHOLD: Number(optEnv('PRICE_SPIKE_THRESHOLD') || '0.85'),
     // Intervals (ms)
     SYNC_INTERVAL: 3_600_000,
     DETECTION_INTERVAL: 3_600_000,

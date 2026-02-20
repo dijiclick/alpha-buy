@@ -1,12 +1,12 @@
 import { spawn } from 'child_process';
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
-import { getActiveEventsWithMarkets, upsertOutcome, getMarketDbId } from '../db/supabase.js';
+import { getHighPriceEvents, upsertOutcome, getMarketDbId } from '../db/supabase.js';
 const log = createLogger('agent');
 
 // ─── Bridge pool (one process per session token) ───
 
-const _bridges = [];  // Array of { bridge, token, index }
+const _bridges = [];
 
 function spawnBridge(token, index) {
     log.info(`Spawning bridge #${index}...`);
@@ -124,11 +124,11 @@ function getBridge(slotIndex) {
     return bridge;
 }
 
-// ─── Public entry point ───
+// ─── Public entry points ───
 
 export function startResolutionAgent(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
-    log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s, ${concurrency} concurrent bridges)`);
+    log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s, ${concurrency} bridges, price_threshold=${config.PRICE_SPIKE_THRESHOLD})`);
     const run = async () => {
         try {
             await runAgentCycle(state);
@@ -141,11 +141,21 @@ export function startResolutionAgent(state) {
     setInterval(run, config.DETECTION_INTERVAL);
 }
 
+// Exported so websocket.js can trigger immediate checks
+export async function checkAndProcessEvent(event, state) {
+    // Use bridge slot 0 for WebSocket-triggered checks
+    return processEvent(event, state.trackedEvents.get(event.polymarket_event_id), 0, state, _counters);
+}
+
+const _counters = { newTracked: 0, rechecked: 0, resolved: 0 };
+
 async function runAgentCycle(state) {
-    const events = await getActiveEventsWithMarkets();
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
 
-    // Build work queue: events that need processing
+    // Price-first filter: only events with a market priced ≥ threshold
+    const events = await getHighPriceEvents(config.PRICE_SPIKE_THRESHOLD);
+
+    // Build work queue
     const queue = [];
     for (const event of events) {
         if (event.closed || !event.markets || event.markets.length === 0)
@@ -162,15 +172,10 @@ async function runAgentCycle(state) {
         }
     }
 
-    if (queue.length === 0) {
-        // Still clean up stale tracked entries
-        cleanupTracked(state, events);
-        return;
-    }
+    if (queue.length === 0) return;
 
-    log.info(`Agent: ${queue.length} events to process with ${concurrency} workers`);
+    log.info(`Agent: ${queue.length} high-price events to check (≥${config.PRICE_SPIKE_THRESHOLD}) with ${concurrency} bridges`);
 
-    // Shared counters (safe — JS is single-threaded, mutations happen between awaits)
     const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
     // Worker function: each worker owns one bridge slot
@@ -182,16 +187,13 @@ async function runAgentCycle(state) {
         }
     }
 
-    // Launch N concurrent workers
     await Promise.all(
         Array.from({ length: Math.min(concurrency, queue.length) }, (_, i) => worker(i))
     );
 
-    cleanupTracked(state, events);
-
     const total = state.trackedEvents.size;
     if (total > 0 || counters.resolved > 0 || counters.newTracked > 0) {
-        log.info(`Agent: ${counters.newTracked} new events, ${counters.rechecked} re-checked, ${counters.resolved} resolved, ${total} tracking`);
+        log.info(`Agent: ${counters.newTracked} new, ${counters.rechecked} re-checked, ${counters.resolved} resolved, ${total} tracking`);
     }
 }
 
@@ -201,7 +203,6 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
     if (!result) return;
 
     if (!tracked) {
-        // New event
         if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
             await writeEventResults(event, result);
             state.trackedEvents.delete(eventId);
@@ -210,7 +211,7 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
         else {
             await writeEventEstimatedEnds(event, result);
             const nextCheck = calculateNextCheck(result.estimatedEndMin, 0);
-            const entry = {
+            state.trackedEvents.set(eventId, {
                 eventId,
                 title: event.title,
                 marketCount: event.markets.length,
@@ -219,14 +220,12 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
                 lastChecked: Date.now(),
                 checkCount: 1,
                 nextCheckAt: nextCheck,
-            };
-            state.trackedEvents.set(eventId, entry);
+            });
             counters.newTracked++;
-            log.info(`TRACKING EVENT: "${event.title.slice(0, 80)}" (${event.markets.length} markets) — est: ${result.estimatedEndMin || '?'}..${result.estimatedEndMax || '?'}, recheck: ${new Date(nextCheck).toISOString()}`);
+            log.info(`TRACKING: "${event.title.slice(0, 80)}" est: ${result.estimatedEndMin || '?'}..${result.estimatedEndMax || '?'}, next: ${new Date(nextCheck).toISOString()}`);
         }
     }
     else {
-        // Re-check existing
         tracked.lastChecked = Date.now();
         tracked.checkCount++;
 
@@ -234,7 +233,7 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
             await writeEventResults(event, result);
             state.trackedEvents.delete(eventId);
             counters.resolved++;
-            log.info(`EVENT RESOLVED after ${tracked.checkCount} checks: "${event.title.slice(0, 80)}" → ${result.answer}`);
+            log.info(`RESOLVED after ${tracked.checkCount} checks: "${event.title.slice(0, 80)}" → ${result.answer}`);
         }
         else {
             if (result.estimatedEndMin) {
@@ -244,51 +243,23 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
             }
             tracked.nextCheckAt = calculateNextCheck(tracked.estimatedEndMin, tracked.checkCount);
             counters.rechecked++;
-            log.info(`RE-CHECK EVENT #${tracked.checkCount}: "${event.title.slice(0, 60)}" — still pending, next: ${new Date(tracked.nextCheckAt).toISOString()}`);
-        }
-    }
-}
-
-function cleanupTracked(state, events) {
-    for (const [eventId] of state.trackedEvents) {
-        if (!events.find(e => e.polymarket_event_id === eventId)) {
-            state.trackedEvents.delete(eventId);
         }
     }
 }
 
 function calculateNextCheck(estimatedEndISO, checkCount = 0) {
-    const MIN_INTERVAL = 10 * 60 * 1000;  // 10 min floor
+    const MIN_INTERVAL = 10 * 60 * 1000;
 
-    // No estimated end → default cycle
-    if (!estimatedEndISO) {
-        return Date.now() + config.DETECTION_INTERVAL;
-    }
+    if (!estimatedEndISO) return Date.now() + config.DETECTION_INTERVAL;
 
     const endTime = new Date(estimatedEndISO).getTime();
     const remaining = endTime - Date.now();
 
-    // Past due — hammer it every 10 min
-    if (remaining <= 0) {
-        return Date.now() + MIN_INTERVAL;
-    }
-    // Under 1 hour — every 10 min
-    if (remaining <= 60 * 60 * 1000) {
-        return Date.now() + MIN_INTERVAL;
-    }
-    // Under 4 hours — every 30 min
-    if (remaining <= 4 * 60 * 60 * 1000) {
-        return Date.now() + 30 * 60 * 1000;
-    }
-    // Under 24 hours — every 2 hours
-    if (remaining <= 24 * 60 * 60 * 1000) {
-        return Date.now() + 2 * 60 * 60 * 1000;
-    }
-    // Under 3 days — every 6 hours
-    if (remaining <= 3 * 24 * 60 * 60 * 1000) {
-        return Date.now() + 6 * 60 * 60 * 1000;
-    }
-    // More than 3 days away — sleep until 24h before estimated end
+    if (remaining <= 0) return Date.now() + MIN_INTERVAL;
+    if (remaining <= 60 * 60 * 1000) return Date.now() + MIN_INTERVAL;
+    if (remaining <= 4 * 60 * 60 * 1000) return Date.now() + 30 * 60 * 1000;
+    if (remaining <= 24 * 60 * 60 * 1000) return Date.now() + 2 * 60 * 60 * 1000;
+    if (remaining <= 3 * 24 * 60 * 60 * 1000) return Date.now() + 6 * 60 * 60 * 1000;
     return endTime - 24 * 60 * 60 * 1000;
 }
 
@@ -319,16 +290,14 @@ async function checkEventWithPerplexity(event, slotIndex) {
             return null;
         }
 
-        // Parse per-market outcomes from the markets array
         const marketOutcomes = Array.isArray(parsed.markets)
             ? parsed.markets.map(m => ({
-                index: (m.market || 1) - 1,  // 1-based → 0-based
+                index: (m.market || 1) - 1,
                 outcome: m.outcome || 'unknown',
                 confidence: Number(m.confidence) || 0,
             }))
             : [];
 
-        // Find winning market (highest-confidence "yes")
         const winner = marketOutcomes
             .filter(m => m.outcome === 'yes')
             .sort((a, b) => b.confidence - a.confidence)[0] || null;
@@ -347,8 +316,7 @@ async function checkEventWithPerplexity(event, slotIndex) {
         };
     }
     catch (e) {
-        log.warn(`Perplexity check failed (bridge#${slotIndex}) for event "${event.title.slice(0, 60)}"`, e.message);
-        // If bridge died, null it so next call spawns a fresh one
+        log.warn(`Perplexity check failed (bridge#${slotIndex}) for "${event.title.slice(0, 60)}"`, e.message);
         if (_bridges[slotIndex]?.bridge?.dead) _bridges[slotIndex] = null;
         return null;
     }
@@ -360,7 +328,6 @@ async function writeEventResults(event, result) {
     const markets = event.markets;
     const outcomes = result.marketOutcomes || [];
 
-    // Build a lookup: 0-based index → outcome from Perplexity
     const outcomeMap = new Map();
     for (const mo of outcomes) {
         if (mo.index >= 0 && mo.index < markets.length) {
@@ -389,11 +356,11 @@ async function writeEventResults(event, result) {
     }
 
     if (alertMarket) {
-        log.info(`EVENT MAPPED: "${event.title.slice(0, 60)}" → "${alertMarket.market.question.slice(0, 60)}" = YES (${alertMarket.confidence}%)`);
+        log.info(`MAPPED: "${event.title.slice(0, 60)}" → "${alertMarket.market.question.slice(0, 60)}" = YES (${alertMarket.confidence}%)`);
         const prices = await fetchPrices(alertMarket.market);
         await sendTelegramAlert(event, alertMarket.market, { ...result, outcome: 'yes' }, prices);
     } else {
-        log.warn(`EVENT NO YES: "${event.title.slice(0, 60)}" answer="${result.answer}" — no market got YES`);
+        log.warn(`NO YES: "${event.title.slice(0, 60)}" answer="${result.answer}"`);
     }
 }
 
@@ -430,10 +397,7 @@ async function writeResult(market, result) {
 async function writeEstimatedEnd(market, result) {
     const marketId = market.polymarket_market_id;
     const dbId = market.id || await getMarketDbId(marketId);
-    if (!dbId) {
-        log.error(`Cannot find DB id for market ${marketId}`);
-        return;
-    }
+    if (!dbId) return;
 
     await upsertOutcome({
         market_id: dbId,
@@ -445,8 +409,6 @@ async function writeEstimatedEnd(market, result) {
         estimated_end_max: result.estimatedEndMax || null,
         is_resolved: false,
     });
-
-    log.info(`ESTIMATED END written: "${market.question.slice(0, 60)}" → ${result.estimatedEndMin || '?'}..${result.estimatedEndMax || '?'}`);
 }
 
 // ─── Prices ───
@@ -462,7 +424,6 @@ async function fetchPrices(market) {
     try {
         const tokenIds = parseTokenIds(market);
 
-        // 1. Try CLOB order book (best for active markets — shows spread = alpha)
         if (tokenIds) {
             const [yesBook, noBook] = await Promise.all([
                 fetch(`${config.CLOB_BASE}/book?token_id=${tokenIds[0]}`).then(r => r.json()),
@@ -479,7 +440,6 @@ async function fetchPrices(market) {
             }
         }
 
-        // 2. Try gamma API for latest prices (works for resolved/thin markets)
         if (market.condition_id) {
             const res = await fetch(`${config.GAMMA_BASE}/markets/${market.condition_id}`);
             if (res.ok) {
@@ -491,7 +451,6 @@ async function fetchPrices(market) {
             }
         }
 
-        // 3. Fall back to stored outcome_prices from DB
         const stored = typeof market.outcome_prices === 'string'
             ? JSON.parse(market.outcome_prices) : market.outcome_prices;
         if (stored?.length >= 2) {
@@ -536,7 +495,6 @@ async function sendTelegramAlert(event, market, result, prices) {
 
     const icon = r => r === 'yes' ? '✅' : r === 'no' ? '❌' : '❓';
 
-    // Header
     const lines = [];
     if (result.resolved) {
         lines.push(`🟢 <b>RESOLVED</b>  ·  ${result.confidence}%`);
@@ -546,13 +504,11 @@ async function sendTelegramAlert(event, market, result, prices) {
     lines.push('');
     lines.push(`<b>${event.title}</b>`);
 
-    // Answer — only show if meaningful
     const answer = result.answer || result.reasoning || '';
     if (answer && answer !== 'unknown') {
         lines.push(`<i>${answer}</i>`);
     }
 
-    // Per-market outcomes — collapse if all same
     const outcomes = result.marketOutcomes || [];
     if (outcomes.length > 0) {
         const allSame = outcomes.every(m => m.outcome === outcomes[0].outcome);
@@ -567,7 +523,6 @@ async function sendTelegramAlert(event, market, result, prices) {
         }
     }
 
-    // Prices
     if (prices) {
         lines.push('');
         if (prices.type === 'book') {
@@ -577,7 +532,6 @@ async function sendTelegramAlert(event, market, result, prices) {
         }
     }
 
-    // Timing — only if pending
     if (!result.resolved) {
         const fExact = formatDate(result.estimatedEnd);
         const fMin = formatDate(result.estimatedEndMin);
@@ -597,15 +551,13 @@ async function sendTelegramAlert(event, market, result, prices) {
     lines.push('');
     lines.push(`<a href="${eventUrl}">Event</a>  ·  <a href="${marketUrl}">Market</a>`);
 
-    const text = lines.join('\n');
-
     try {
         const res = await fetch(`https://api.telegram.org/bot${config.TELEGRAM_BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_id: config.TELEGRAM_CHAT_ID,
-                text,
+                text: lines.join('\n'),
                 parse_mode: 'HTML',
                 disable_web_page_preview: true,
             }),
