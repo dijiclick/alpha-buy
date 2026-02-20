@@ -159,7 +159,7 @@ async function triggerCheck(tokenId, state, reason) {
         const event = await getEventByMarketTokenId(tokenId);
         if (!event || !event.markets || event.markets.length === 0) return;
 
-        log.info(`WS TRIGGER [${reason}]: "${event.title.slice(0, 60)}" — checking with Sonar`);
+        log.info(`WS TRIGGER [${reason}]: "${event.title.slice(0, 60)}" — checking with Perplexity`);
         await checkAndProcessEvent(event, state);
     } catch (e) {
         log.warn(`WS trigger check failed: ${e.message}`);

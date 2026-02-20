@@ -36,6 +36,54 @@ export async function upsertMarket(row) {
     }
     return data?.id ?? null;
 }
+// ─── Batch upserts (50x faster than single-row) ───
+export async function upsertEventsBatch(rows) {
+    if (rows.length === 0) return new Map();
+    const db = getDb();
+    const now = new Date().toISOString();
+    const payload = rows.map(r => ({ ...r, updated_at: now }));
+    const idMap = new Map(); // polymarket_event_id → db id
+    // Supabase has payload size limits, batch in chunks of 50
+    const BATCH = 50;
+    for (let i = 0; i < payload.length; i += BATCH) {
+        const chunk = payload.slice(i, i + BATCH);
+        const { data, error } = await db
+            .from('events')
+            .upsert(chunk, { onConflict: 'polymarket_event_id' })
+            .select('id, polymarket_event_id');
+        if (error) {
+            log.error(`batch upsert events failed (chunk ${i / BATCH})`, error.message);
+            continue;
+        }
+        for (const row of data || []) {
+            idMap.set(row.polymarket_event_id, row.id);
+        }
+    }
+    return idMap;
+}
+export async function upsertMarketsBatch(rows) {
+    if (rows.length === 0) return new Map();
+    const db = getDb();
+    const now = new Date().toISOString();
+    const payload = rows.map(r => ({ ...r, updated_at: now }));
+    const idMap = new Map(); // polymarket_market_id → db id
+    const BATCH = 100;
+    for (let i = 0; i < payload.length; i += BATCH) {
+        const chunk = payload.slice(i, i + BATCH);
+        const { data, error } = await db
+            .from('markets')
+            .upsert(chunk, { onConflict: 'polymarket_market_id' })
+            .select('id, polymarket_market_id');
+        if (error) {
+            log.error(`batch upsert markets failed (chunk ${i / BATCH})`, error.message);
+            continue;
+        }
+        for (const row of data || []) {
+            idMap.set(row.polymarket_market_id, row.id);
+        }
+    }
+    return idMap;
+}
 export async function upsertOutcome(row) {
     const db = getDb();
     const payload = { ...row, updated_at: new Date().toISOString() };
@@ -209,18 +257,15 @@ export async function getHighPriceEvents(threshold) {
 }
 export async function getEventByMarketTokenId(tokenId) {
     const db = getDb();
-    // Find market containing this token ID, return its event with all markets
-    const { data: markets } = await db
+    // Direct DB query: find market whose clob_token_ids JSON array contains this tokenId
+    const { data: market } = await db
         .from('markets')
-        .select('event_id, clob_token_ids')
+        .select('event_id')
         .eq('active', true)
-        .eq('closed', false);
-    if (!markets) return null;
-    const market = markets.find(m => {
-        const ids = typeof m.clob_token_ids === 'string'
-            ? JSON.parse(m.clob_token_ids) : m.clob_token_ids;
-        return ids && ids.includes(tokenId);
-    });
+        .eq('closed', false)
+        .like('clob_token_ids', `%${tokenId}%`)
+        .limit(1)
+        .single();
     if (!market) return null;
     const { data: event } = await db
         .from('events')

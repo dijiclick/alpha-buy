@@ -41,7 +41,7 @@ async function main() {
     // Phase 5: Status reporting
     setInterval(() => {
         const s = state.stats();
-        log.info(`STATUS: events=${s.events} markets=${s.markets} tracked=${s.tracked}`);
+        log.info(`STATUS: events=${s.events} markets=${s.markets} tracked=${s.tracked} resolved=${s.resolved}`);
         if (state.trackedEvents.size > 0) {
             for (const [, t] of state.trackedEvents) {
                 const next = t.nextCheckAt ? new Date(t.nextCheckAt).toISOString() : 'unknown';

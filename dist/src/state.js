@@ -4,9 +4,11 @@ const log = createLogger('state');
 const STATE_FILE = 'state.json';
 export class State {
     trackedEvents = new Map(); // eventId → { title, marketCount, estimatedEnd, lastChecked, checkCount, nextCheckAt }
+    resolvedEventIds = new Set(); // eventIds already resolved (skip re-checking)
     knownEventIds = new Set();
     knownMarketIds = new Set();
     marketsByQuestion = new Map(); // normalizedQuestion → marketId
+    tokenToEventId = new Map(); // YES tokenId → polymarket_event_id (for fast WS lookups)
     backfillComplete = false;
     load() {
         if (!existsSync(STATE_FILE)) {
@@ -25,7 +27,9 @@ export class State {
                 this.marketsByQuestion.set(q, id);
             for (const [id, entry] of data.trackedEvents || [])
                 this.trackedEvents.set(id, entry);
-            log.info(`State loaded: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets, ${this.trackedEvents.size} tracked events, backfill=${this.backfillComplete}`);
+            for (const id of data.resolvedEventIds || [])
+                this.resolvedEventIds.add(id);
+            log.info(`State loaded: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets, ${this.trackedEvents.size} tracked, ${this.resolvedEventIds.size} resolved, backfill=${this.backfillComplete}`);
         }
         catch (e) {
             log.error('Failed to load state.json', e.message);
@@ -39,6 +43,7 @@ export class State {
                 knownMarketIds: [...this.knownMarketIds],
                 marketsByQuestion: [...this.marketsByQuestion.entries()],
                 trackedEvents: [...this.trackedEvents.entries()],
+                resolvedEventIds: [...this.resolvedEventIds],
             };
             writeFileSync(STATE_FILE, JSON.stringify(data));
             log.debug(`State persisted: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets, ${this.trackedEvents.size} tracked events`);
@@ -52,6 +57,7 @@ export class State {
             events: this.knownEventIds.size,
             markets: this.knownMarketIds.size,
             tracked: this.trackedEvents.size,
+            resolved: this.resolvedEventIds.size,
         };
     }
 }

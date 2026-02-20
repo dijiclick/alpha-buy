@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
-import { getHighPriceEvents, upsertOutcome, getMarketDbId } from '../db/supabase.js';
+import { getHighPriceEvents, upsertOutcome } from '../db/supabase.js';
 const log = createLogger('agent');
 
 // ─── Bridge pool (one process per session token) ───
@@ -29,9 +29,7 @@ function spawnBridge(token, index) {
         for (const line of lines) {
             if (!line.trim()) continue;
             const entry = waiters.shift();
-            if (entry && !entry.done) {
-                entry.done = true;
-                clearTimeout(entry.timer);
+            if (entry) {
                 entry.resolve(line);
             }
         }
@@ -157,11 +155,19 @@ async function runAgentCycle(state) {
 
     // Build work queue
     const queue = [];
+    let skippedResolved = 0;
     for (const event of events) {
         if (event.closed || !event.markets || event.markets.length === 0)
             continue;
 
         const eventId = event.polymarket_event_id;
+
+        // Skip events we already know are resolved
+        if (state.resolvedEventIds.has(eventId)) {
+            skippedResolved++;
+            continue;
+        }
+
         const tracked = state.trackedEvents.get(eventId);
 
         if (!tracked) {
@@ -174,7 +180,7 @@ async function runAgentCycle(state) {
 
     if (queue.length === 0) return;
 
-    log.info(`Agent: ${queue.length} high-price events to check (≥${config.PRICE_SPIKE_THRESHOLD}) with ${concurrency} bridges`);
+    log.info(`Agent: ${queue.length} to check (≥${config.PRICE_SPIKE_THRESHOLD}), ${skippedResolved} already resolved, ${concurrency} bridges`);
 
     const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
@@ -183,8 +189,13 @@ async function runAgentCycle(state) {
         while (queue.length > 0) {
             const item = queue.shift();
             if (!item) break;
-            await processEvent(item.event, item.tracked, slotIndex, state, counters);
+            try {
+                await processEvent(item.event, item.tracked, slotIndex, state, counters);
+            } catch (e) {
+                log.error(`Worker#${slotIndex} processEvent error: ${e.message}`);
+            }
         }
+        log.info(`Worker#${slotIndex} finished (queue empty)`);
     }
 
     await Promise.all(
@@ -206,6 +217,7 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
         if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
             await writeEventResults(event, result);
             state.trackedEvents.delete(eventId);
+            state.resolvedEventIds.add(eventId);
             counters.resolved++;
         }
         else {
@@ -232,6 +244,7 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
         if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
             await writeEventResults(event, result);
             state.trackedEvents.delete(eventId);
+            state.resolvedEventIds.add(eventId);
             counters.resolved++;
             log.info(`RESOLVED after ${tracked.checkCount} checks: "${event.title.slice(0, 80)}" → ${result.answer}`);
         }
@@ -357,7 +370,10 @@ async function writeEventResults(event, result) {
 
     if (alertMarket) {
         log.info(`MAPPED: "${event.title.slice(0, 60)}" → "${alertMarket.market.question.slice(0, 60)}" = YES (${alertMarket.confidence}%)`);
-        const prices = await fetchPrices(alertMarket.market);
+        // For resolved events, use implied prices (YES→1.00, NO→0.00) instead of fetching from dead order books
+        const prices = result.resolved
+            ? { type: 'resolved', yes: '1.00', no: '0.00' }
+            : await fetchPrices(alertMarket.market);
         await sendTelegramAlert(event, alertMarket.market, { ...result, outcome: 'yes' }, prices);
     } else {
         log.warn(`NO YES: "${event.title.slice(0, 60)}" answer="${result.answer}"`);
@@ -373,10 +389,9 @@ async function writeEventEstimatedEnds(event, result) {
 // ─── DB writers ───
 
 async function writeResult(market, result) {
-    const marketId = market.polymarket_market_id;
-    const dbId = market.id || await getMarketDbId(marketId);
+    const dbId = market.id;
     if (!dbId) {
-        log.error(`Cannot find DB id for market ${marketId}`);
+        log.error(`Cannot find DB id for market ${market.polymarket_market_id}`);
         return;
     }
 
@@ -395,8 +410,7 @@ async function writeResult(market, result) {
 }
 
 async function writeEstimatedEnd(market, result) {
-    const marketId = market.polymarket_market_id;
-    const dbId = market.id || await getMarketDbId(marketId);
+    const dbId = market.id;
     if (!dbId) return;
 
     await upsertOutcome({
