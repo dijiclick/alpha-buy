@@ -1,7 +1,33 @@
+import { spawn } from 'child_process';
+import { writeFile, unlink } from 'fs/promises';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
 import { getActiveMarkets, upsertOutcome, getMarketDbId } from '../db/supabase.js';
 const log = createLogger('agent');
+
+function runCmd(cmd, args, opts) {
+    return new Promise((resolve, reject) => {
+        const child = spawn(cmd, args, { ...opts, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '', stderr = '';
+        child.stdout.on('data', d => stdout += d);
+        child.stderr.on('data', d => stderr += d);
+        const timer = setTimeout(() => { child.kill(); reject(new Error('Timeout')); }, opts.timeout || 60000);
+        child.on('close', code => {
+            clearTimeout(timer);
+            if (code !== 0) {
+                const err = new Error(`Exit code ${code}`);
+                err.stdout = stdout;
+                err.stderr = stderr;
+                reject(err);
+            } else {
+                resolve({ stdout, stderr });
+            }
+        });
+        child.on('error', e => { clearTimeout(timer); reject(e); });
+    });
+}
 
 export function startResolutionAgent(state) {
     log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s)`);
@@ -27,19 +53,12 @@ async function runAgentCycle(state) {
         if (mkt.closed)
             continue;
 
-        const prices = (mkt.outcome_prices || []).map(Number).filter(n => !isNaN(n));
-        if (prices.length === 0)
-            continue;
-        const maxPrice = Math.max(...prices);
-        if (maxPrice < config.PRICE_TRIGGER)
-            continue;
-
         const marketId = mkt.polymarket_market_id;
         const tracked = state.trackedMarkets.get(marketId);
 
         if (!tracked) {
             // New market above trigger — initial check
-            const result = await checkWithHaiku(mkt);
+            const result = await checkWithPerplexity(mkt);
             if (!result)
                 continue;
 
@@ -63,13 +82,14 @@ async function runAgentCycle(state) {
                 newTracked++;
                 log.info(`TRACKING: "${mkt.question.slice(0, 80)}" — estimated end: ${result.estimatedEnd || 'unknown'}`);
             }
+            await sleep(2000);
         }
         else {
             // Already tracking — should we re-check?
             if (Date.now() < tracked.nextCheckAt)
                 continue;
 
-            const result = await checkWithHaiku(mkt);
+            const result = await checkWithPerplexity(mkt);
             if (!result)
                 continue;
 
@@ -92,6 +112,7 @@ async function runAgentCycle(state) {
                 rechecked++;
                 log.info(`RE-CHECK #${tracked.checkCount}: "${mkt.question.slice(0, 60)}" — still pending, next check: ${new Date(tracked.nextCheckAt).toISOString()}`);
             }
+            await sleep(2000);
         }
     }
 
@@ -133,62 +154,55 @@ function calculateNextCheck(estimatedEndISO, checkCount = 0) {
     return Date.now() + 6 * 60 * 60 * 1000;
 }
 
-async function checkWithHaiku(mkt) {
-    if (!config.PUTER_TOKEN) {
-        log.warn('No PUTER_TOKEN configured');
+async function checkWithPerplexity(mkt) {
+    if (!config.PERPLEXITY_SESSION_TOKEN) {
+        log.warn('No PERPLEXITY_SESSION_TOKEN configured');
         return null;
     }
 
     try {
-        const res = await fetch('https://api.puter.com/puterai/openai/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${config.PUTER_TOKEN}`,
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model: 'claude-haiku-4-5',
-                messages: [
-                    {
-                        role: 'system',
-                        content: 'You determine if real-world events have already happened. Return JSON only, no markdown fences.',
-                    },
-                    {
-                        role: 'user',
-                        content: `Has this event already resolved/finished?
-
-Question: "${mkt.question}"
-Context: ${mkt.description || 'none'}
-Market end date: ${mkt.end_date || 'none'}
-
-Return ONLY this JSON:
-{
-  "resolved": true or false,
-  "outcome": "yes" or "no" or "unknown",
-  "confidence": 0 to 100,
-  "estimated_end": "ISO date when event will finish, or null if resolved or unknown",
-  "reasoning": "one sentence"
-}`,
-                    },
-                ],
-                temperature: 0.1,
-                max_tokens: 200,
-            }),
+        const input = JSON.stringify({
+            question: mkt.question,
+            description: mkt.description || '',
+            end_date: mkt.end_date || '',
         });
 
-        if (!res.ok) {
-            const body = await res.text().catch(() => '');
-            log.warn(`Puter API ${res.status}: ${body.slice(0, 200)}`);
+        // Write input to temp file (uv run can consume stdin during dep resolution)
+        const tmpFile = join(tmpdir(), `perplexity_input_${Date.now()}.json`);
+        await writeFile(tmpFile, input);
+
+        let stdout, stderr;
+        try {
+            ({ stdout, stderr } = await runCmd(
+                config.PYTHON_CMD,
+                ['run', '--script', config.PERPLEXITY_BRIDGE_PATH, tmpFile],
+                {
+                    env: {
+                        ...process.env,
+                        PERPLEXITY_SESSION_TOKEN: config.PERPLEXITY_SESSION_TOKEN,
+                    },
+                    timeout: 60_000,
+                }
+            ));
+        } finally {
+            await unlink(tmpFile).catch(() => {});
+        }
+
+        if (stderr) {
+            log.debug(`Perplexity bridge stderr: ${stderr.slice(0, 200)}`);
+        }
+
+        if (!stdout || !stdout.trim()) {
+            log.warn('Perplexity bridge returned empty stdout');
             return null;
         }
 
-        const data = await res.json();
-        const content = data.choices?.[0]?.message?.content;
-        if (!content)
-            return null;
+        const parsed = JSON.parse(stdout.trim());
 
-        const cleaned = content.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-        const parsed = JSON.parse(cleaned);
+        if (parsed.error) {
+            log.warn(`Perplexity bridge error: ${parsed.error}`);
+            return null;
+        }
 
         return {
             resolved: parsed.resolved === true,
@@ -196,13 +210,17 @@ Return ONLY this JSON:
             confidence: Number(parsed.confidence) || 0,
             estimatedEnd: parsed.estimated_end || null,
             reasoning: parsed.reasoning || '',
-            source: 'haiku',
+            source: 'perplexity',
         };
     }
     catch (e) {
-        log.warn(`Haiku check failed for "${mkt.question.slice(0, 60)}"`, e.message);
+        log.warn(`Perplexity check failed for "${mkt.question.slice(0, 60)}"`, e.message);
         return null;
     }
+}
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function writeResult(market, result) {

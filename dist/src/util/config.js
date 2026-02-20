@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 function env(key) {
     const v = process.env[key];
     if (!v)
@@ -8,12 +10,19 @@ function env(key) {
 function optEnv(key) {
     return process.env[key] || undefined;
 }
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const PROJECT_ROOT = join(__dirname, '..', '..', '..');
 export const config = {
     // Supabase
     SUPABASE_URL: env('SUPABASE_URL'),
     SUPABASE_KEY: env('SUPABASE_SERVICE_KEY'),
-    // Puter (free Claude Haiku via puter.com)
-    PUTER_TOKEN: env('PUTER_TOKEN'),
+    // Perplexity
+    PERPLEXITY_SESSION_TOKEN: env('PERPLEXITY_SESSION_TOKEN'),
+    // Python bridge
+    PYTHON_CMD: optEnv('PYTHON_CMD') || 'uv',
+    PERPLEXITY_BRIDGE_PATH: optEnv('PERPLEXITY_BRIDGE_PATH')
+        || join(PROJECT_ROOT, 'scripts', 'perplexity_bridge.py'),
     // Brave Search (future)
     BRAVE_API_KEY: optEnv('BRAVE_API_KEY'),
     // API bases
@@ -21,7 +30,6 @@ export const config = {
     // Tag IDs
     CRYPTO_TAG_ID: 21,
     // Thresholds
-    PRICE_TRIGGER: 0.85,
     MIN_CONFIDENCE: 80,
     // Intervals (ms)
     SYNC_INTERVAL: 3_600_000,
