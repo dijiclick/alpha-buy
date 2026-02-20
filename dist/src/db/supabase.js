@@ -104,6 +104,58 @@ export async function getMarketDbId(polymarketMarketId) {
         .single();
     return data?.id ?? null;
 }
+export async function closeStaleEvents(activeGammaIds) {
+    const db = getDb();
+    // Get all polymarket_event_ids that are active+open in our DB
+    const dbActiveIds = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+        const { data, error } = await db
+            .from('events')
+            .select('polymarket_event_id')
+            .eq('active', true)
+            .eq('closed', false)
+            .range(from, from + pageSize - 1);
+        if (error) {
+            log.error('closeStaleEvents query failed', error.message);
+            return 0;
+        }
+        if (!data || data.length === 0) break;
+        dbActiveIds.push(...data.map(r => r.polymarket_event_id));
+        if (data.length < pageSize) break;
+        from += pageSize;
+    }
+    // Find DB events no longer in Gamma's active results → they closed/resolved
+    const staleIds = dbActiveIds.filter(id => !activeGammaIds.has(id));
+    if (staleIds.length === 0) return 0;
+    const now = new Date().toISOString();
+    // Mark events as closed
+    const { error: evErr } = await db
+        .from('events')
+        .update({ closed: true, updated_at: now })
+        .in('polymarket_event_id', staleIds);
+    if (evErr) {
+        log.error('closeStaleEvents (events) failed', evErr.message);
+        return 0;
+    }
+    // Get DB IDs of those events to close their markets too
+    const { data: eventRows } = await db
+        .from('events')
+        .select('id')
+        .in('polymarket_event_id', staleIds);
+    if (eventRows?.length) {
+        const { error: mktErr } = await db
+            .from('markets')
+            .update({ closed: true, updated_at: now })
+            .in('event_id', eventRows.map(r => r.id));
+        if (mktErr) {
+            log.error('closeStaleEvents (markets) failed', mktErr.message);
+        }
+    }
+    log.info(`Closed ${staleIds.length} stale events (no longer active on Polymarket)`);
+    return staleIds.length;
+}
 export async function getActiveMarkets() {
     const db = getDb();
     const results = [];

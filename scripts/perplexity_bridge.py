@@ -13,15 +13,17 @@ Server mode (--server):
   writes JSON lines to stdout. ~5-10s faster per query after the first.
 
 Event mode input:  { "mode": "event", "event_title": str, "event_description": str,
-                     "end_date": str, "market_questions": [str, ...] }
+                     "end_date": str, "market_questions": [str, ...],
+                     "market_descriptions": [str, ...] (optional, resolution rules) }
 Event mode output: { "resolved": bool, "answer": str, "winning_market_index": int|null,
-                     "confidence": int, "estimated_end_min": str|null,
-                     "estimated_end_max": str|null, "reasoning": str }
+                     "confidence": int, "estimated_end": str|null,
+                     "estimated_end_min": str|null, "estimated_end_max": str|null,
+                     "reasoning": str }
 
 Market mode input:  { "question": str, "description": str, "end_date": str }
 Market mode output: { "resolved": bool, "outcome": str, "confidence": int,
-                      "estimated_end_min": str|null, "estimated_end_max": str|null,
-                      "reasoning": str }
+                      "estimated_end": str|null, "estimated_end_min": str|null,
+                      "estimated_end_max": str|null, "reasoning": str }
 """
 
 import json
@@ -135,8 +137,17 @@ def build_event_prompt(input_data):
     desc = input_data.get("event_description", "")
     end_date = input_data.get("end_date", "")
     questions = input_data.get("market_questions", [])
+    descriptions = input_data.get("market_descriptions", [])
 
-    mq_list = "\n".join(f"  {i+1}. {q}" for i, q in enumerate(questions))
+    # Build market list with resolution rules when available
+    mq_lines = []
+    for i, q in enumerate(questions):
+        mq_lines.append(f"  {i+1}. {q}")
+        if i < len(descriptions) and descriptions[i]:
+            # Truncate very long descriptions to save tokens
+            rule = descriptions[i][:500]
+            mq_lines.append(f"     Resolution rules: {rule}")
+    mq_list = "\n".join(mq_lines)
 
     return (
         f"Today is {_today()}.\n\n"
@@ -149,22 +160,22 @@ def build_event_prompt(input_data):
         f"{mq_list}\n\n"
         f"Search for the latest news about this event.\n\n"
         f"Rules:\n"
+        f"- READ each market's resolution rules carefully. Pay attention to "
+        f"exact dates, years, and what YES vs NO means for each market.\n"
         f"- resolved=true ONLY if the outcome is officially confirmed "
         f"(final score, winner declared, bill signed, official announcement). "
         f"Predictions, polls, and forecasts do NOT count.\n"
         f"- For EACH market, give outcome: \"yes\", \"no\", or \"unknown\".\n"
-        f"- If not resolved, figure out the KEY MOMENT that decides it "
-        f"(game kickoff, vote time, announcement date, deadline) and give "
-        f"a time RANGE for when the outcome will be known:\n"
-        f"  - estimated_end_min: EARLIEST the result could be known (ISO datetime+tz)\n"
-        f"  - estimated_end_max: LATEST the result could be known (ISO datetime+tz)\n"
-        f"  - E.g. NBA game tips off 8pm → min=game end ~10pm, max=overtime ~11:30pm\n"
-        f"  - E.g. bill vote on Feb 25 → min=start of session, max=end of day\n"
-        f"  - If only a date is known, use start and end of that day\n"
-        f"- recheck_in_minutes: how many minutes from now should I check again "
-        f"to catch the result the fastest? "
-        f"(e.g. game in 3 hours → 180, vote happening right now → 15, "
-        f"election next month → 43200)\n\n"
+        f"- If not resolved, find the EXACT time the outcome will be known "
+        f"(game end, vote result, announcement, deadline).\n"
+        f"  - estimated_end: EXACT datetime if known, else null\n"
+        f"  - If exact time is unknown, give a range:\n"
+        f"    - estimated_end_min: EARLIEST possible\n"
+        f"    - estimated_end_max: LATEST possible\n"
+        f"  - ALL datetimes must be UTC with seconds: YYYY-MM-DDTHH:MM:SSZ\n"
+        f"  - E.g. NBA game tips off 8pm ET → min=2026-02-21T03:00:00Z, max=2026-02-21T04:30:00Z\n"
+        f"  - E.g. bill vote Feb 25 2pm ET → exact=2026-02-25T19:00:00Z\n"
+        f"  - E.g. deadline end of March → exact=null, min/max=2026-03-31T23:59:59Z\n\n"
         f"CRITICAL formatting rules:\n"
         f"- answer: MAX 10 words. E.g. \"Team A won 3-1\" or "
         f"\"Match starts Feb 22 at 8pm EST\" or \"No result yet, game tomorrow\"\n"
@@ -177,9 +188,9 @@ def build_event_prompt(input_data):
         f'{{"market":1,"outcome":"yes/no/unknown","confidence":0-100}},'
         f'...],'
         f'"confidence":0-100,'
-        f'"estimated_end_min":"ISO datetime or null",'
-        f'"estimated_end_max":"ISO datetime or null",'
-        f'"recheck_in_minutes":number,'
+        f'"estimated_end":"YYYY-MM-DDTHH:MM:SSZ or null",'
+        f'"estimated_end_min":"YYYY-MM-DDTHH:MM:SSZ or null",'
+        f'"estimated_end_max":"YYYY-MM-DDTHH:MM:SSZ or null",'
         f'"reasoning":"max 15 words"}}'
     )
 
@@ -201,12 +212,10 @@ def build_market_prompt(input_data):
         f"- resolved=true ONLY if the outcome is officially confirmed "
         f"(final score, winner declared, official announcement). "
         f"Predictions and forecasts do NOT count.\n"
-        f"- If not resolved, figure out the KEY MOMENT that decides it "
-        f"and give a time RANGE:\n"
-        f"  - estimated_end_min: earliest the result could be known (ISO datetime+tz)\n"
-        f"  - estimated_end_max: latest the result could be known\n"
-        f"- recheck_in_minutes: how many minutes from now should I check "
-        f"again to catch the result fastest?\n\n"
+        f"- If not resolved, find the EXACT time the outcome will be known.\n"
+        f"  - estimated_end: exact datetime if known, else null\n"
+        f"  - If exact time unknown, give estimated_end_min and estimated_end_max\n"
+        f"  - ALL datetimes must be UTC with seconds: YYYY-MM-DDTHH:MM:SSZ\n\n"
         f"CRITICAL formatting rules:\n"
         f"- answer: MAX 10 words.\n"
         f"- reasoning: MAX 15 words.\n\n"
@@ -214,9 +223,9 @@ def build_market_prompt(input_data):
         f'{{"resolved":true/false,'
         f'"outcome":"yes/no/unknown",'
         f'"confidence":0-100,'
-        f'"estimated_end_min":"ISO datetime or null",'
-        f'"estimated_end_max":"ISO datetime or null",'
-        f'"recheck_in_minutes":number,'
+        f'"estimated_end":"YYYY-MM-DDTHH:MM:SSZ or null",'
+        f'"estimated_end_min":"YYYY-MM-DDTHH:MM:SSZ or null",'
+        f'"estimated_end_max":"YYYY-MM-DDTHH:MM:SSZ or null",'
         f'"reasoning":"max 15 words"}}'
     )
 

@@ -10,6 +10,19 @@ function env(key) {
 function optEnv(key) {
     return process.env[key] || undefined;
 }
+function getPerplexityTokens() {
+    const tokens = [];
+    // Primary token (required)
+    const primary = process.env.PERPLEXITY_SESSION_TOKEN;
+    if (!primary) throw new Error('Missing env: PERPLEXITY_SESSION_TOKEN');
+    tokens.push(primary);
+    // Additional tokens: PERPLEXITY_SESSION_TOKEN_2, _3, etc.
+    for (let i = 2; i <= 10; i++) {
+        const t = process.env[`PERPLEXITY_SESSION_TOKEN_${i}`];
+        if (t) tokens.push(t);
+    }
+    return tokens;
+}
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const PROJECT_ROOT = join(__dirname, '..', '..', '..');
@@ -17,8 +30,8 @@ export const config = {
     // Supabase
     SUPABASE_URL: env('SUPABASE_URL'),
     SUPABASE_KEY: env('SUPABASE_SERVICE_KEY'),
-    // Perplexity
-    PERPLEXITY_SESSION_TOKEN: env('PERPLEXITY_SESSION_TOKEN'),
+    // Perplexity (multiple tokens = concurrent bridges)
+    PERPLEXITY_SESSION_TOKENS: getPerplexityTokens(),
     // Python bridge
     PYTHON_CMD: optEnv('PYTHON_CMD') || 'uv',
     PERPLEXITY_BRIDGE_PATH: optEnv('PERPLEXITY_BRIDGE_PATH')

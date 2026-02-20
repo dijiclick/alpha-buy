@@ -4,19 +4,17 @@ import { createLogger } from '../util/logger.js';
 import { getActiveEventsWithMarkets, upsertOutcome, getMarketDbId } from '../db/supabase.js';
 const log = createLogger('agent');
 
-// ─── Persistent Perplexity bridge ───
+// ─── Bridge pool (one process per session token) ───
 
-let _bridge = null;
+const _bridges = [];  // Array of { bridge, token, index }
 
-function getBridge() {
-    if (_bridge && !_bridge.dead) return _bridge;
-
-    log.info('Spawning persistent Perplexity bridge process...');
+function spawnBridge(token, index) {
+    log.info(`Spawning bridge #${index}...`);
 
     const child = spawn(config.PYTHON_CMD,
         ['run', '--script', config.PERPLEXITY_BRIDGE_PATH, '--server'],
         {
-            env: { ...process.env, PERPLEXITY_SESSION_TOKEN: config.PERPLEXITY_SESSION_TOKEN },
+            env: { ...process.env, PERPLEXITY_SESSION_TOKEN: token },
             stdio: ['pipe', 'pipe', 'pipe'],
         }
     );
@@ -27,7 +25,7 @@ function getBridge() {
     child.stdout.on('data', (chunk) => {
         buffer += chunk.toString();
         const lines = buffer.split('\n');
-        buffer = lines.pop(); // keep incomplete last line
+        buffer = lines.pop();
         for (const line of lines) {
             if (!line.trim()) continue;
             const entry = waiters.shift();
@@ -42,21 +40,21 @@ function getBridge() {
     child.stderr.on('data', d => {
         const msg = d.toString().trim();
         if (!msg) return;
-        // Surface rate limits and errors at warn level
         if (/RATE_LIMITED|SESSION_ERR|ERROR|FAILED/i.test(msg)) {
-            log.warn(`Bridge: ${msg.slice(0, 500)}`);
+            log.warn(`Bridge#${index}: ${msg.slice(0, 500)}`);
         } else {
-            log.info(`Bridge: ${msg.slice(0, 300)}`);
+            log.info(`Bridge#${index}: ${msg.slice(0, 300)}`);
         }
     });
 
     const b = {
         child,
         dead: false,
+        index,
 
         query(input) {
             return new Promise((resolve, reject) => {
-                if (this.dead) return reject(new Error('Bridge is dead'));
+                if (this.dead) return reject(new Error(`Bridge#${index} is dead`));
 
                 const entry = { done: false };
 
@@ -65,7 +63,7 @@ function getBridge() {
                     entry.done = true;
                     const idx = waiters.indexOf(entry);
                     if (idx !== -1) waiters.splice(idx, 1);
-                    reject(new Error('Bridge timeout (90s)'));
+                    reject(new Error(`Bridge#${index} timeout (90s)`));
                 }, 90_000);
 
                 entry.resolve = (line) => {
@@ -94,31 +92,43 @@ function getBridge() {
     };
 
     child.on('close', (code) => {
-        log.warn(`Bridge exited (code ${code})`);
+        log.warn(`Bridge#${index} exited (code ${code})`);
         b.dead = true;
         while (waiters.length) {
             const entry = waiters.shift();
             if (!entry.done) {
                 entry.done = true;
                 clearTimeout(entry.timer);
-                entry.reject(new Error(`Bridge died (code ${code})`));
+                entry.reject(new Error(`Bridge#${index} died (code ${code})`));
             }
         }
     });
 
     child.on('error', (e) => {
-        log.warn(`Bridge spawn error: ${e.message}`);
+        log.warn(`Bridge#${index} spawn error: ${e.message}`);
         b.dead = true;
     });
 
-    _bridge = b;
     return b;
+}
+
+function getBridge(slotIndex) {
+    const slot = _bridges[slotIndex];
+    if (slot && slot.bridge && !slot.bridge.dead) return slot.bridge;
+
+    const token = config.PERPLEXITY_SESSION_TOKENS[slotIndex];
+    if (!token) return null;
+
+    const bridge = spawnBridge(token, slotIndex);
+    _bridges[slotIndex] = { bridge, token, index: slotIndex };
+    return bridge;
 }
 
 // ─── Public entry point ───
 
 export function startResolutionAgent(state) {
-    log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s)`);
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
+    log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s, ${concurrency} concurrent bridges)`);
     const run = async () => {
         try {
             await runAgentCycle(state);
@@ -133,10 +143,10 @@ export function startResolutionAgent(state) {
 
 async function runAgentCycle(state) {
     const events = await getActiveEventsWithMarkets();
-    let newTracked = 0;
-    let rechecked = 0;
-    let resolved = 0;
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
 
+    // Build work queue: events that need processing
+    const queue = [];
     for (const event of events) {
         if (event.closed || !event.markets || event.markets.length === 0)
             continue;
@@ -145,84 +155,110 @@ async function runAgentCycle(state) {
         const tracked = state.trackedEvents.get(eventId);
 
         if (!tracked) {
-            const result = await checkEventWithPerplexity(event);
-            if (!result)
-                continue;
-
-            if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
-                await writeEventResults(event, result);
-                state.trackedEvents.delete(eventId);
-                resolved++;
-            }
-            else {
-                await writeEventEstimatedEnds(event, result);
-                const nextCheck = calculateNextCheck(result.estimatedEndMin, 0, result.recheckMinutes);
-                const entry = {
-                    eventId,
-                    title: event.title,
-                    marketCount: event.markets.length,
-                    estimatedEndMin: result.estimatedEndMin || null,
-                    estimatedEndMax: result.estimatedEndMax || null,
-                    lastChecked: Date.now(),
-                    checkCount: 1,
-                    nextCheckAt: nextCheck,
-                };
-                state.trackedEvents.set(eventId, entry);
-                newTracked++;
-                log.info(`TRACKING EVENT: "${event.title.slice(0, 80)}" (${event.markets.length} markets) — est: ${result.estimatedEndMin || '?'}..${result.estimatedEndMax || '?'}, recheck: ${new Date(nextCheck).toISOString()}`);
-            }
+            queue.push({ event, tracked: null });
         }
-        else {
-            if (Date.now() < tracked.nextCheckAt)
-                continue;
-
-            const result = await checkEventWithPerplexity(event);
-            if (!result)
-                continue;
-
-            tracked.lastChecked = Date.now();
-            tracked.checkCount++;
-
-            if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
-                await writeEventResults(event, result);
-                state.trackedEvents.delete(eventId);
-                resolved++;
-                log.info(`EVENT RESOLVED after ${tracked.checkCount} checks: "${event.title.slice(0, 80)}" → ${result.answer}`);
-            }
-            else {
-                if (result.estimatedEndMin) {
-                    tracked.estimatedEndMin = result.estimatedEndMin;
-                    tracked.estimatedEndMax = result.estimatedEndMax;
-                    await writeEventEstimatedEnds(event, result);
-                }
-                tracked.nextCheckAt = calculateNextCheck(tracked.estimatedEndMin, tracked.checkCount, result.recheckMinutes);
-                rechecked++;
-                log.info(`RE-CHECK EVENT #${tracked.checkCount}: "${event.title.slice(0, 60)}" — still pending, next: ${new Date(tracked.nextCheckAt).toISOString()}`);
-            }
+        else if (Date.now() >= tracked.nextCheckAt) {
+            queue.push({ event, tracked });
         }
     }
 
-    // Clean up tracked events no longer active
+    if (queue.length === 0) {
+        // Still clean up stale tracked entries
+        cleanupTracked(state, events);
+        return;
+    }
+
+    log.info(`Agent: ${queue.length} events to process with ${concurrency} workers`);
+
+    // Shared counters (safe — JS is single-threaded, mutations happen between awaits)
+    const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
+
+    // Worker function: each worker owns one bridge slot
+    async function worker(slotIndex) {
+        while (queue.length > 0) {
+            const item = queue.shift();
+            if (!item) break;
+            await processEvent(item.event, item.tracked, slotIndex, state, counters);
+        }
+    }
+
+    // Launch N concurrent workers
+    await Promise.all(
+        Array.from({ length: Math.min(concurrency, queue.length) }, (_, i) => worker(i))
+    );
+
+    cleanupTracked(state, events);
+
+    const total = state.trackedEvents.size;
+    if (total > 0 || counters.resolved > 0 || counters.newTracked > 0) {
+        log.info(`Agent: ${counters.newTracked} new events, ${counters.rechecked} re-checked, ${counters.resolved} resolved, ${total} tracking`);
+    }
+}
+
+async function processEvent(event, tracked, slotIndex, state, counters) {
+    const eventId = event.polymarket_event_id;
+    const result = await checkEventWithPerplexity(event, slotIndex);
+    if (!result) return;
+
+    if (!tracked) {
+        // New event
+        if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
+            await writeEventResults(event, result);
+            state.trackedEvents.delete(eventId);
+            counters.resolved++;
+        }
+        else {
+            await writeEventEstimatedEnds(event, result);
+            const nextCheck = calculateNextCheck(result.estimatedEndMin, 0);
+            const entry = {
+                eventId,
+                title: event.title,
+                marketCount: event.markets.length,
+                estimatedEndMin: result.estimatedEndMin || null,
+                estimatedEndMax: result.estimatedEndMax || null,
+                lastChecked: Date.now(),
+                checkCount: 1,
+                nextCheckAt: nextCheck,
+            };
+            state.trackedEvents.set(eventId, entry);
+            counters.newTracked++;
+            log.info(`TRACKING EVENT: "${event.title.slice(0, 80)}" (${event.markets.length} markets) — est: ${result.estimatedEndMin || '?'}..${result.estimatedEndMax || '?'}, recheck: ${new Date(nextCheck).toISOString()}`);
+        }
+    }
+    else {
+        // Re-check existing
+        tracked.lastChecked = Date.now();
+        tracked.checkCount++;
+
+        if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
+            await writeEventResults(event, result);
+            state.trackedEvents.delete(eventId);
+            counters.resolved++;
+            log.info(`EVENT RESOLVED after ${tracked.checkCount} checks: "${event.title.slice(0, 80)}" → ${result.answer}`);
+        }
+        else {
+            if (result.estimatedEndMin) {
+                tracked.estimatedEndMin = result.estimatedEndMin;
+                tracked.estimatedEndMax = result.estimatedEndMax;
+                await writeEventEstimatedEnds(event, result);
+            }
+            tracked.nextCheckAt = calculateNextCheck(tracked.estimatedEndMin, tracked.checkCount);
+            counters.rechecked++;
+            log.info(`RE-CHECK EVENT #${tracked.checkCount}: "${event.title.slice(0, 60)}" — still pending, next: ${new Date(tracked.nextCheckAt).toISOString()}`);
+        }
+    }
+}
+
+function cleanupTracked(state, events) {
     for (const [eventId] of state.trackedEvents) {
         if (!events.find(e => e.polymarket_event_id === eventId)) {
             state.trackedEvents.delete(eventId);
         }
     }
-
-    const total = state.trackedEvents.size;
-    if (total > 0 || resolved > 0 || newTracked > 0) {
-        log.info(`Agent: ${newTracked} new events, ${rechecked} re-checked, ${resolved} resolved, ${total} tracking`);
-    }
 }
 
-function calculateNextCheck(estimatedEndISO, checkCount = 0, recheckMinutes = null) {
+function calculateNextCheck(estimatedEndISO, checkCount = 0) {
     const MIN_INTERVAL = 10 * 60 * 1000;  // 10 min floor
-
-    // If Perplexity told us when to recheck, trust it (floor 10 min, no ceiling)
-    if (recheckMinutes != null && recheckMinutes > 0) {
-        const ms = Math.max(MIN_INTERVAL, recheckMinutes * 60 * 1000);
-        return Date.now() + ms;
-    }
 
     // No estimated end → default cycle
     if (!estimatedEndISO) {
@@ -253,15 +289,15 @@ function calculateNextCheck(estimatedEndISO, checkCount = 0, recheckMinutes = nu
         return Date.now() + 6 * 60 * 60 * 1000;
     }
     // More than 3 days away — sleep until 24h before estimated end
-    // (one check to refresh the estimate, then the tiers above kick in)
     return endTime - 24 * 60 * 60 * 1000;
 }
 
 // ─── Perplexity bridge ───
 
-async function checkEventWithPerplexity(event) {
-    if (!config.PERPLEXITY_SESSION_TOKEN) {
-        log.warn('No PERPLEXITY_SESSION_TOKEN configured');
+async function checkEventWithPerplexity(event, slotIndex) {
+    const bridge = getBridge(slotIndex);
+    if (!bridge) {
+        log.warn(`No bridge available for slot ${slotIndex}`);
         return null;
     }
 
@@ -272,14 +308,14 @@ async function checkEventWithPerplexity(event) {
             event_description: event.description || '',
             end_date: event.end_date || '',
             market_questions: event.markets.map(m => m.question),
+            market_descriptions: event.markets.map(m => m.description || ''),
         };
 
-        const bridge = getBridge();
         const line = await bridge.query(input);
         const parsed = JSON.parse(line);
 
         if (parsed.error) {
-            log.warn(`Perplexity error: ${parsed.error}`);
+            log.warn(`Perplexity error (bridge#${slotIndex}): ${parsed.error}`);
             return null;
         }
 
@@ -303,17 +339,17 @@ async function checkEventWithPerplexity(event) {
             winningMarketIndex: winner ? winner.index : null,
             marketOutcomes,
             confidence: Number(parsed.confidence) || 0,
+            estimatedEnd: parsed.estimated_end || null,
             estimatedEndMin: parsed.estimated_end_min || parsed.estimated_end || null,
             estimatedEndMax: parsed.estimated_end_max || parsed.estimated_end || null,
-            recheckMinutes: Number(parsed.recheck_in_minutes) || null,
             reasoning: parsed.reasoning || '',
             source: 'perplexity',
         };
     }
     catch (e) {
-        log.warn(`Perplexity check failed for event "${event.title.slice(0, 60)}"`, e.message);
+        log.warn(`Perplexity check failed (bridge#${slotIndex}) for event "${event.title.slice(0, 60)}"`, e.message);
         // If bridge died, null it so next call spawns a fresh one
-        if (_bridge?.dead) _bridge = null;
+        if (_bridges[slotIndex]?.bridge?.dead) _bridges[slotIndex] = null;
         return null;
     }
 }
@@ -485,7 +521,6 @@ function formatDate(iso) {
 
 function shortQuestion(q, eventTitle) {
     if (!q) return '?';
-    // Strip event title prefix from market question
     const titleWords = (eventTitle || '').split(/\s+/).slice(0, 4).join(' ');
     if (titleWords.length > 10 && q.startsWith(titleWords)) {
         q = q.slice(eventTitle.length).replace(/^\s*[-–—:]\s*/, '').trim() || q;
@@ -544,18 +579,18 @@ async function sendTelegramAlert(event, market, result, prices) {
 
     // Timing — only if pending
     if (!result.resolved) {
-        const parts = [];
-        if (result.recheckMinutes) parts.push(`⏰ ${result.recheckMinutes}m`);
+        const fExact = formatDate(result.estimatedEnd);
         const fMin = formatDate(result.estimatedEndMin);
         const fMax = formatDate(result.estimatedEndMax);
-        if (fMin && fMax && fMin !== fMax) {
-            parts.push(`📅 ${fMin} – ${fMax}`);
-        } else if (fMin) {
-            parts.push(`📅 ${fMin}`);
-        }
-        if (parts.length) {
+        if (fExact) {
             lines.push('');
-            lines.push(parts.join('  ·  '));
+            lines.push(`📅 ${fExact}`);
+        } else if (fMin && fMax && fMin !== fMax) {
+            lines.push('');
+            lines.push(`📅 ${fMin} – ${fMax}`);
+        } else if (fMin) {
+            lines.push('');
+            lines.push(`📅 ${fMin}`);
         }
     }
 

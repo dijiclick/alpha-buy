@@ -241,6 +241,7 @@ async function main() {
         event_description: event.description || '',
         end_date: event.end_date || '',
         market_questions: event.markets.map(m => m.question),
+        market_descriptions: event.markets.map(m => m.description || ''),
     };
     console.log(`  Sending query for "${event.title.slice(0, 60)}"...`);
 
@@ -275,8 +276,8 @@ async function main() {
     console.log(`  resolved: ${parsed.resolved}`);
     console.log(`  answer: ${parsed.answer}`);
     console.log(`  overall confidence: ${parsed.confidence}`);
-    console.log(`  estimated_end: ${parsed.estimated_end_min || '?'} .. ${parsed.estimated_end_max || '?'}`);
-    console.log(`  recheck_in_minutes: ${parsed.recheck_in_minutes}`);
+    console.log(`  estimated_end: ${parsed.estimated_end || 'null'}`);
+    console.log(`  estimated_end range: ${parsed.estimated_end_min || '?'} .. ${parsed.estimated_end_max || '?'}`);
     console.log(`  reasoning: ${parsed.reasoning}`);
     console.log(`  market outcomes:`);
     for (const mo of marketOutcomes) {
@@ -413,18 +414,18 @@ async function main() {
     }
 
     // Timing info
-    const parts = [];
-    if (parsed.recheck_in_minutes) parts.push(`⏰ ${parsed.recheck_in_minutes}m`);
+    const fExact = fmtDate(parsed.estimated_end);
     const fMin = fmtDate(parsed.estimated_end_min);
     const fMax = fmtDate(parsed.estimated_end_max);
-    if (fMin && fMax && fMin !== fMax) {
-        parts.push(`📅 ${fMin} – ${fMax}`);
-    } else if (fMin) {
-        parts.push(`📅 ${fMin}`);
-    }
-    if (parts.length) {
+    if (fExact) {
         lines.push('');
-        lines.push(parts.join('  ·  '));
+        lines.push(`📅 ${fExact}`);
+    } else if (fMin && fMax && fMin !== fMax) {
+        lines.push('');
+        lines.push(`📅 ${fMin} – ${fMax}`);
+    } else if (fMin) {
+        lines.push('');
+        lines.push(`📅 ${fMin}`);
     }
 
     // Reasoning — only if adds info beyond the answer
