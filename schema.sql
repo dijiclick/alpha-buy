@@ -42,13 +42,10 @@ CREATE TABLE IF NOT EXISTS markets (
   volume_1mo numeric DEFAULT 0,
   one_day_price_change numeric,
   end_date timestamptz,
-  resolution_source text,
-  resolved_by text,
   active boolean DEFAULT true,
   closed boolean DEFAULT false,
   accepting_orders boolean DEFAULT true,
   neg_risk boolean DEFAULT false,
-  automatically_resolved boolean DEFAULT false,
   updated_at timestamptz DEFAULT now()
 );
 

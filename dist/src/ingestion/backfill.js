@@ -76,13 +76,10 @@ export async function backfill(state) {
                     volume_1mo: mkt.volume1mo || 0,
                     one_day_price_change: mkt.oneDayPriceChange,
                     end_date: mkt.endDate || null,
-                    resolution_source: mkt.resolutionSource,
-                    resolved_by: mkt.resolvedBy,
                     active: mkt.active ?? true,
                     closed: mkt.closed ?? false,
                     accepting_orders: mkt.acceptingOrders ?? true,
                     neg_risk: mkt.negRisk ?? false,
-                    automatically_resolved: mkt.automaticallyResolved ?? false,
                 };
                 await upsertMarket(marketRow);
                 state.knownMarketIds.add(mkt.id);

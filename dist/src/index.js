@@ -8,7 +8,7 @@ import { startResolutionAgent } from './detection/agent.js';
 const log = createLogger('main');
 async function main() {
     log.info('Alpha Scanner starting...');
-    log.info(`Config: trigger=${config.PRICE_TRIGGER}, confidence=${config.MIN_CONFIDENCE}`);
+    log.info(`Config: confidence=${config.MIN_CONFIDENCE}`);
     if (process.env.LOG_LEVEL)
         setLogLevel(process.env.LOG_LEVEL);
     // Verify DB connection
@@ -39,10 +39,10 @@ async function main() {
     setInterval(() => {
         const s = state.stats();
         log.info(`STATUS: events=${s.events} markets=${s.markets} tracked=${s.tracked}`);
-        if (state.trackedMarkets.size > 0) {
-            for (const [, t] of state.trackedMarkets) {
+        if (state.trackedEvents.size > 0) {
+            for (const [, t] of state.trackedEvents) {
                 const next = t.nextCheckAt ? new Date(t.nextCheckAt).toISOString() : 'unknown';
-                log.info(`  TRACKING: "${t.question.slice(0, 70)}" checks=${t.checkCount} next=${next}`);
+                log.info(`  TRACKING: "${t.title.slice(0, 70)}" (${t.marketCount} mkts) checks=${t.checkCount} next=${next}`);
             }
         }
     }, config.STATUS_REPORT_INTERVAL);

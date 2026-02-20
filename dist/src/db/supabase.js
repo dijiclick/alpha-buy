@@ -49,6 +49,34 @@ export async function upsertOutcome(row) {
     }
     return data?.id ?? null;
 }
+export async function getActiveEventsWithMarkets() {
+    const db = getDb();
+    const results = [];
+    let from = 0;
+    const pageSize = 1000;
+    while (true) {
+        const { data, error } = await db
+            .from('events')
+            .select('*, markets(*)')
+            .eq('active', true)
+            .eq('closed', false)
+            .range(from, from + pageSize - 1);
+        if (error) {
+            log.error('getActiveEventsWithMarkets failed', error.message);
+            break;
+        }
+        if (!data || data.length === 0) break;
+        results.push(...data);
+        if (data.length < pageSize) break;
+        from += pageSize;
+    }
+    return results
+        .map(event => ({
+            ...event,
+            markets: (event.markets || []).filter(m => m.active && !m.closed),
+        }))
+        .filter(event => event.markets.length > 0);
+}
 // ─── Query helpers ───
 export async function getMarketDbId(polymarketMarketId) {
     const db = getDb();

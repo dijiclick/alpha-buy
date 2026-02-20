@@ -123,7 +123,7 @@ async function backfill(state) {
     let maxEventId = null;
     while (true) {
         page++;
-        const url = `${config.GAMMA_BASE}/events?exclude_tag_id=${config.CRYPTO_TAG_ID}&active=true&limit=${config.PAGE_SIZE}&offset=${offset}`;
+        const url = `${config.GAMMA_BASE}/events?exclude_tag_id=${config.CRYPTO_TAG_ID}&closed=false&limit=${config.PAGE_SIZE}&offset=${offset}`;
         let events;
         try {
             const res = await fetch(url);
@@ -163,7 +163,7 @@ async function backfill(state) {
     saveState(state);
     log.info(`Backfill complete: ${totalEvents} events, ${totalMarkets} markets`);
 }
-// --- Incremental Sync (only fetches events newer than watermark) ---
+// --- Incremental Sync (only fetches NEW events with closed=false) ---
 async function syncRecent(state) {
     const watermark = state.lastSyncedEventId;
     if (!watermark) {
@@ -177,7 +177,7 @@ async function syncRecent(state) {
 
     while (true) {
         pages++;
-        const url = `${config.GAMMA_BASE}/events?exclude_tag_id=${config.CRYPTO_TAG_ID}&active=true&order=id&ascending=false&limit=100&offset=${offset}`;
+        const url = `${config.GAMMA_BASE}/events?exclude_tag_id=${config.CRYPTO_TAG_ID}&closed=false&order=id&ascending=false&limit=100&offset=${offset}`;
         let events;
         try {
             const res = await fetch(url);
@@ -249,7 +249,7 @@ async function main() {
     else {
         log.info('Backfill already complete, skipping');
     }
-    // Start sync loop — only fetches NEW events every 3 hours
+    // Start sync loop — only fetches NEW open events every 3 hours
     log.info(`Sync every ${config.SYNC_INTERVAL / 1000 / 60 / 60}h (watermark: ${state.lastSyncedEventId})`);
     setInterval(() => syncRecent(state), config.SYNC_INTERVAL);
     // Status report every minute

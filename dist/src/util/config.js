@@ -23,8 +23,11 @@ export const config = {
     PYTHON_CMD: optEnv('PYTHON_CMD') || 'uv',
     PERPLEXITY_BRIDGE_PATH: optEnv('PERPLEXITY_BRIDGE_PATH')
         || join(PROJECT_ROOT, 'scripts', 'perplexity_bridge.py'),
-    // Brave Search (future)
-    BRAVE_API_KEY: optEnv('BRAVE_API_KEY'),
+    // Telegram
+    TELEGRAM_BOT_TOKEN: optEnv('TELEGRAM_BOT_TOKEN'),
+    TELEGRAM_CHAT_ID: optEnv('TELEGRAM_CHAT_ID'),
+    // CLOB API
+    CLOB_BASE: 'https://clob.polymarket.com',
     // API bases
     GAMMA_BASE: 'https://gamma-api.polymarket.com',
     // Tag IDs
