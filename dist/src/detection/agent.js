@@ -156,19 +156,20 @@ async function runAgentCycle(state) {
             }
             else {
                 await writeEventEstimatedEnds(event, result);
-                const nextCheck = calculateNextCheck(result.estimatedEnd, 0, result.recheckMinutes);
+                const nextCheck = calculateNextCheck(result.estimatedEndMin, 0, result.recheckMinutes);
                 const entry = {
                     eventId,
                     title: event.title,
                     marketCount: event.markets.length,
-                    estimatedEnd: result.estimatedEnd || null,
+                    estimatedEndMin: result.estimatedEndMin || null,
+                    estimatedEndMax: result.estimatedEndMax || null,
                     lastChecked: Date.now(),
                     checkCount: 1,
                     nextCheckAt: nextCheck,
                 };
                 state.trackedEvents.set(eventId, entry);
                 newTracked++;
-                log.info(`TRACKING EVENT: "${event.title.slice(0, 80)}" (${event.markets.length} markets) — est: ${result.estimatedEnd || 'unknown'}, recheck: ${new Date(nextCheck).toISOString()}`);
+                log.info(`TRACKING EVENT: "${event.title.slice(0, 80)}" (${event.markets.length} markets) — est: ${result.estimatedEndMin || '?'}..${result.estimatedEndMax || '?'}, recheck: ${new Date(nextCheck).toISOString()}`);
             }
         }
         else {
@@ -189,11 +190,12 @@ async function runAgentCycle(state) {
                 log.info(`EVENT RESOLVED after ${tracked.checkCount} checks: "${event.title.slice(0, 80)}" → ${result.answer}`);
             }
             else {
-                if (result.estimatedEnd) {
-                    tracked.estimatedEnd = result.estimatedEnd;
+                if (result.estimatedEndMin) {
+                    tracked.estimatedEndMin = result.estimatedEndMin;
+                    tracked.estimatedEndMax = result.estimatedEndMax;
                     await writeEventEstimatedEnds(event, result);
                 }
-                tracked.nextCheckAt = calculateNextCheck(tracked.estimatedEnd, tracked.checkCount, result.recheckMinutes);
+                tracked.nextCheckAt = calculateNextCheck(tracked.estimatedEndMin, tracked.checkCount, result.recheckMinutes);
                 rechecked++;
                 log.info(`RE-CHECK EVENT #${tracked.checkCount}: "${event.title.slice(0, 60)}" — still pending, next: ${new Date(tracked.nextCheckAt).toISOString()}`);
             }
@@ -301,7 +303,8 @@ async function checkEventWithPerplexity(event) {
             winningMarketIndex: winner ? winner.index : null,
             marketOutcomes,
             confidence: Number(parsed.confidence) || 0,
-            estimatedEnd: parsed.estimated_end || null,
+            estimatedEndMin: parsed.estimated_end_min || parsed.estimated_end || null,
+            estimatedEndMax: parsed.estimated_end_max || parsed.estimated_end || null,
             recheckMinutes: Number(parsed.recheck_in_minutes) || null,
             reasoning: parsed.reasoning || '',
             source: 'perplexity',
@@ -380,7 +383,8 @@ async function writeResult(market, result) {
         confidence: result.confidence,
         detection_source: result.source,
         detected_at: new Date().toISOString(),
-        estimated_end: null,
+        estimated_end_min: null,
+        estimated_end_max: null,
         is_resolved: true,
     });
 
@@ -401,11 +405,12 @@ async function writeEstimatedEnd(market, result) {
         confidence: 0,
         detection_source: result.source,
         detected_at: new Date().toISOString(),
-        estimated_end: result.estimatedEnd || null,
+        estimated_end_min: result.estimatedEndMin || null,
+        estimated_end_max: result.estimatedEndMax || null,
         is_resolved: false,
     });
 
-    log.info(`ESTIMATED END written: "${market.question.slice(0, 60)}" → ${result.estimatedEnd || 'unknown'}`);
+    log.info(`ESTIMATED END written: "${market.question.slice(0, 60)}" → ${result.estimatedEndMin || '?'}..${result.estimatedEndMax || '?'}`);
 }
 
 // ─── Prices ───
@@ -539,13 +544,18 @@ async function sendTelegramAlert(event, market, result, prices) {
 
     // Timing — only if pending
     if (!result.resolved) {
-        const timing = [];
-        if (result.recheckMinutes) timing.push(`⏰ ${result.recheckMinutes}m`);
-        const fmtDate = formatDate(result.estimatedEnd);
-        if (fmtDate) timing.push(`📅 ${fmtDate}`);
-        if (timing.length) {
+        const parts = [];
+        if (result.recheckMinutes) parts.push(`⏰ ${result.recheckMinutes}m`);
+        const fMin = formatDate(result.estimatedEndMin);
+        const fMax = formatDate(result.estimatedEndMax);
+        if (fMin && fMax && fMin !== fMax) {
+            parts.push(`📅 ${fMin} – ${fMax}`);
+        } else if (fMin) {
+            parts.push(`📅 ${fMin}`);
+        }
+        if (parts.length) {
             lines.push('');
-            lines.push(timing.join('  ·  '));
+            lines.push(parts.join('  ·  '));
         }
     }
 

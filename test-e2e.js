@@ -275,7 +275,7 @@ async function main() {
     console.log(`  resolved: ${parsed.resolved}`);
     console.log(`  answer: ${parsed.answer}`);
     console.log(`  overall confidence: ${parsed.confidence}`);
-    console.log(`  estimated_end: ${parsed.estimated_end}`);
+    console.log(`  estimated_end: ${parsed.estimated_end_min || '?'} .. ${parsed.estimated_end_max || '?'}`);
     console.log(`  recheck_in_minutes: ${parsed.recheck_in_minutes}`);
     console.log(`  reasoning: ${parsed.reasoning}`);
     console.log(`  market outcomes:`);
@@ -290,20 +290,35 @@ async function main() {
         const market = event.markets[mo.index];
         if (!market) continue;
 
-        const { data: outData, error: outErr } = await db
+        const payload = {
+            market_id: market.id,
+            detected_outcome: mo.outcome,
+            confidence: mo.confidence,
+            detection_source: 'perplexity',
+            detected_at: new Date().toISOString(),
+            estimated_end_min: parsed.estimated_end_min || null,
+            estimated_end_max: parsed.estimated_end_max || null,
+            is_resolved: parsed.resolved === true,
+            updated_at: new Date().toISOString(),
+        };
+
+        let { data: outData, error: outErr } = await db
             .from('outcomes')
-            .upsert({
-                market_id: market.id,
-                detected_outcome: mo.outcome,
-                confidence: mo.confidence,
-                detection_source: 'perplexity',
-                detected_at: new Date().toISOString(),
-                estimated_end: parsed.estimated_end || null,
-                is_resolved: parsed.resolved === true,
-                updated_at: new Date().toISOString(),
-            }, { onConflict: 'market_id' })
+            .upsert(payload, { onConflict: 'market_id' })
             .select('id')
             .single();
+
+        // If columns don't exist yet (pre-migration), retry without them
+        if (outErr?.message?.toLowerCase().includes('could not find') && outErr?.message?.toLowerCase().includes('column')) {
+            const safe = { ...payload };
+            delete safe.estimated_end_min;
+            delete safe.estimated_end_max;
+            ({ data: outData, error: outErr } = await db
+                .from('outcomes')
+                .upsert(safe, { onConflict: 'market_id' })
+                .select('id')
+                .single());
+        }
 
         if (outErr) {
             console.log(`  FAILED market ${market.id}: ${outErr.message}`);
@@ -398,13 +413,18 @@ async function main() {
     }
 
     // Timing info
-    const timing = [];
-    if (parsed.recheck_in_minutes) timing.push(`⏰ ${parsed.recheck_in_minutes}m`);
-    const fd = fmtDate(parsed.estimated_end);
-    if (fd) timing.push(`📅 ${fd}`);
-    if (timing.length) {
+    const parts = [];
+    if (parsed.recheck_in_minutes) parts.push(`⏰ ${parsed.recheck_in_minutes}m`);
+    const fMin = fmtDate(parsed.estimated_end_min);
+    const fMax = fmtDate(parsed.estimated_end_max);
+    if (fMin && fMax && fMin !== fMax) {
+        parts.push(`📅 ${fMin} – ${fMax}`);
+    } else if (fMin) {
+        parts.push(`📅 ${fMin}`);
+    }
+    if (parts.length) {
         lines.push('');
-        lines.push(timing.join('  ·  '));
+        lines.push(parts.join('  ·  '));
     }
 
     // Reasoning — only if adds info beyond the answer

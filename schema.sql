@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
   confidence int DEFAULT 0,
   detection_source text,
   detected_at timestamptz,
-  estimated_end timestamptz,
+  estimated_end_min timestamptz,
+  estimated_end_max timestamptz,
   is_resolved boolean DEFAULT false,
   updated_at timestamptz DEFAULT now()
 );

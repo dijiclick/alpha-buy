@@ -15,11 +15,13 @@ Server mode (--server):
 Event mode input:  { "mode": "event", "event_title": str, "event_description": str,
                      "end_date": str, "market_questions": [str, ...] }
 Event mode output: { "resolved": bool, "answer": str, "winning_market_index": int|null,
-                     "confidence": int, "estimated_end": str|null, "reasoning": str }
+                     "confidence": int, "estimated_end_min": str|null,
+                     "estimated_end_max": str|null, "reasoning": str }
 
 Market mode input:  { "question": str, "description": str, "end_date": str }
 Market mode output: { "resolved": bool, "outcome": str, "confidence": int,
-                      "estimated_end": str|null, "reasoning": str }
+                      "estimated_end_min": str|null, "estimated_end_max": str|null,
+                      "reasoning": str }
 """
 
 import json
@@ -153,8 +155,12 @@ def build_event_prompt(input_data):
         f"- For EACH market, give outcome: \"yes\", \"no\", or \"unknown\".\n"
         f"- If not resolved, figure out the KEY MOMENT that decides it "
         f"(game kickoff, vote time, announcement date, deadline) and give "
-        f"estimated_end as a precise ISO datetime with timezone if possible "
-        f"(e.g. \"2026-02-22T20:00:00-05:00\"), otherwise just the date.\n"
+        f"a time RANGE for when the outcome will be known:\n"
+        f"  - estimated_end_min: EARLIEST the result could be known (ISO datetime+tz)\n"
+        f"  - estimated_end_max: LATEST the result could be known (ISO datetime+tz)\n"
+        f"  - E.g. NBA game tips off 8pm → min=game end ~10pm, max=overtime ~11:30pm\n"
+        f"  - E.g. bill vote on Feb 25 → min=start of session, max=end of day\n"
+        f"  - If only a date is known, use start and end of that day\n"
         f"- recheck_in_minutes: how many minutes from now should I check again "
         f"to catch the result the fastest? "
         f"(e.g. game in 3 hours → 180, vote happening right now → 15, "
@@ -171,7 +177,8 @@ def build_event_prompt(input_data):
         f'{{"market":1,"outcome":"yes/no/unknown","confidence":0-100}},'
         f'...],'
         f'"confidence":0-100,'
-        f'"estimated_end":"ISO datetime or null",'
+        f'"estimated_end_min":"ISO datetime or null",'
+        f'"estimated_end_max":"ISO datetime or null",'
         f'"recheck_in_minutes":number,'
         f'"reasoning":"max 15 words"}}'
     )
@@ -195,8 +202,9 @@ def build_market_prompt(input_data):
         f"(final score, winner declared, official announcement). "
         f"Predictions and forecasts do NOT count.\n"
         f"- If not resolved, figure out the KEY MOMENT that decides it "
-        f"and give estimated_end as a precise ISO datetime with timezone "
-        f"if possible, otherwise just the date.\n"
+        f"and give a time RANGE:\n"
+        f"  - estimated_end_min: earliest the result could be known (ISO datetime+tz)\n"
+        f"  - estimated_end_max: latest the result could be known\n"
         f"- recheck_in_minutes: how many minutes from now should I check "
         f"again to catch the result fastest?\n\n"
         f"CRITICAL formatting rules:\n"
@@ -206,7 +214,8 @@ def build_market_prompt(input_data):
         f'{{"resolved":true/false,'
         f'"outcome":"yes/no/unknown",'
         f'"confidence":0-100,'
-        f'"estimated_end":"ISO datetime or null",'
+        f'"estimated_end_min":"ISO datetime or null",'
+        f'"estimated_end_max":"ISO datetime or null",'
         f'"recheck_in_minutes":number,'
         f'"reasoning":"max 15 words"}}'
     )

@@ -38,12 +38,29 @@ export async function upsertMarket(row) {
 }
 export async function upsertOutcome(row) {
     const db = getDb();
+    const payload = { ...row, updated_at: new Date().toISOString() };
     const { data, error } = await db
         .from('outcomes')
-        .upsert({ ...row, updated_at: new Date().toISOString() }, { onConflict: 'market_id' })
+        .upsert(payload, { onConflict: 'market_id' })
         .select('id')
         .single();
     if (error) {
+        // If columns don't exist yet (pre-migration), retry without them
+        if (error.message?.toLowerCase().includes('could not find') && error.message?.toLowerCase().includes('column')) {
+            const safe = { ...payload };
+            delete safe.estimated_end_min;
+            delete safe.estimated_end_max;
+            const { data: d2, error: e2 } = await db
+                .from('outcomes')
+                .upsert(safe, { onConflict: 'market_id' })
+                .select('id')
+                .single();
+            if (e2) {
+                log.error(`upsert outcome for market ${row.market_id} failed`, e2.message);
+                return null;
+            }
+            return d2?.id ?? null;
+        }
         log.error(`upsert outcome for market ${row.market_id} failed`, error.message);
         return null;
     }
