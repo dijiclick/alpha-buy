@@ -210,6 +210,23 @@ async function runAgentCycle(state) {
 
 async function processEvent(event, tracked, slotIndex, state, counters) {
     const eventId = event.polymarket_event_id;
+
+    // Pre-flight: skip if already closed on Polymarket (saves expensive Perplexity query)
+    const firstMarket = event.markets?.[0];
+    if (firstMarket?.condition_id) {
+        try {
+            const gmRes = await fetch(`${config.GAMMA_BASE}/markets/${firstMarket.condition_id}`);
+            if (gmRes.ok) {
+                const live = await gmRes.json();
+                if (live.closed) {
+                    log.info(`SKIP (closed on PM): "${event.title.slice(0, 60)}"`);
+                    state.resolvedEventIds.add(eventId);
+                    return;
+                }
+            }
+        } catch {}
+    }
+
     const result = await checkEventWithPerplexity(event, slotIndex);
     if (!result) return;
 
@@ -370,22 +387,6 @@ async function writeEventResults(event, result) {
 
     if (alertMarket) {
         log.info(`MAPPED: "${event.title.slice(0, 60)}" → "${alertMarket.market.question.slice(0, 60)}" = YES (${alertMarket.confidence}%)`);
-
-        // Skip if market already resolved on Polymarket (no opportunity)
-        if (alertMarket.market.condition_id) {
-            try {
-                const gmRes = await fetch(`${config.GAMMA_BASE}/markets/${alertMarket.market.condition_id}`);
-                if (gmRes.ok) {
-                    const live = await gmRes.json();
-                    if (live.closed) {
-                        log.info(`SKIP: "${alertMarket.market.question.slice(0, 60)}" already closed on Polymarket`);
-                        return;
-                    }
-                }
-            } catch (e) {
-                log.warn(`Gamma check failed for "${alertMarket.market.question.slice(0, 40)}"`, e.message);
-            }
-        }
 
         // Always try real prices first (for profit calc), fall back to implied for resolved
         const realPrices = await fetchPrices(alertMarket.market);
