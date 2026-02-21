@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
-import { getHighPriceEvents, getHotEvents, upsertOutcome } from '../db/supabase.js';
+import { getHighPriceEvents, getEventsByPolymarketIds, upsertOutcome } from '../db/supabase.js';
 const log = createLogger('agent');
 
 // ─── Bridge pool (one process per session token) ───
@@ -244,37 +244,57 @@ async function runAgentCycle(state) {
 }
 
 // ─── Hot loop: events ending NOW (every 2 min) ───
+// Uses Perplexity's estimatedEndMin (precise) instead of Polymarket's end_date (imprecise)
 
 async function runHotLoop(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
-    const events = await getHotEvents(config.PRICE_SPIKE_THRESHOLD);
     const now = Date.now();
+    const HOT_LOOKBACK = 20 * 60_000;  // 20min ago
+    const HOT_LOOKAHEAD = 10 * 60_000; // 10min from now
 
-    // Filter & sort: past end_date first (most urgent), then nearest future
+    // Scan tracked events for those whose estimatedEndMin is in the hot zone
+    const hotEventIds = [];
+    for (const [eventId, tracked] of state.trackedEvents) {
+        if (!tracked.estimatedEndMin) continue;
+        const endTime = new Date(tracked.estimatedEndMin).getTime();
+        if (isNaN(endTime)) continue;
+        const remaining = endTime - now;
+        // Hot zone: ended within 20min or ending within 10min
+        if (remaining >= -HOT_LOOKBACK && remaining <= HOT_LOOKAHEAD) {
+            hotEventIds.push(eventId);
+        }
+    }
+
+    if (hotEventIds.length === 0) return;
+
+    // Fetch full event data from DB (need markets for processEvent)
+    const events = await getEventsByPolymarketIds(hotEventIds);
+    const eventMap = new Map(events.map(e => [e.polymarket_event_id, e]));
+
+    // Build queue with tracked data, sorted by urgency
     const queue = [];
-    for (const event of events) {
-        if (event.closed || !event.markets?.length) continue;
-        const eventId = event.polymarket_event_id;
+    for (const eventId of hotEventIds) {
+        const event = eventMap.get(eventId);
+        if (!event || !event.markets?.length) continue;
         if (state.resolvedEventIds.has(eventId)) continue;
         const tracked = state.trackedEvents.get(eventId);
-        queue.push({ event, tracked: tracked || null });
+        queue.push({ event, tracked });
     }
 
     if (queue.length === 0) return;
 
-    // Sort: past end_date first, then by proximity to now
+    // Sort: past estimatedEndMin first, then nearest future
     queue.sort((a, b) => {
-        const aEnd = new Date(a.event.end_date).getTime();
-        const bEnd = new Date(b.event.end_date).getTime();
+        const aEnd = new Date(a.tracked.estimatedEndMin).getTime();
+        const bEnd = new Date(b.tracked.estimatedEndMin).getTime();
         const aRemaining = aEnd - now;
         const bRemaining = bEnd - now;
-        // Past events first (negative remaining), then nearest future
         if (aRemaining <= 0 && bRemaining > 0) return -1;
         if (bRemaining <= 0 && aRemaining > 0) return 1;
         return aRemaining - bRemaining;
     });
 
-    log.info(`Hot: ${queue.length} events in zone (ending within 1h or ended <6h ago)`);
+    log.info(`Hot: ${queue.length} events near estimatedEnd (Perplexity-based)`);
 
     const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
@@ -294,7 +314,7 @@ async function runHotLoop(state) {
         Array.from({ length: Math.min(concurrency, queue.length) }, (_, i) => worker(i))
     );
 
-    if (counters.resolved > 0 || counters.newTracked > 0) {
+    if (counters.resolved > 0 || counters.rechecked > 0 || counters.newTracked > 0) {
         log.info(`Hot: ${counters.newTracked} new, ${counters.rechecked} re-checked, ${counters.resolved} resolved`);
     }
 }

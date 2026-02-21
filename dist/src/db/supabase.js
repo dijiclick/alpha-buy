@@ -255,32 +255,29 @@ export async function getHighPriceEvents(threshold) {
         }))
         .filter(event => event.markets.length > 0);
 }
-export async function getHotEvents(threshold) {
+export async function getEventsByPolymarketIds(eventIds) {
+    if (eventIds.length === 0) return [];
     const db = getDb();
-    const now = new Date();
-    const lookback = new Date(now.getTime() - 6 * 3_600_000).toISOString(); // 6h ago
-    const lookahead = new Date(now.getTime() + 3_600_000).toISOString();    // 1h from now
-    // Step 1: find high-price markets in the hot zone
-    const { data: hotEvents, error } = await db
-        .from('events')
-        .select('*, markets(*)')
-        .eq('active', true)
-        .eq('closed', false)
-        .gte('end_date', lookback)
-        .lte('end_date', lookahead);
-    if (error) {
-        log.error('getHotEvents failed', error.message);
-        return [];
+    const events = [];
+    const batchSize = 100;
+    for (let i = 0; i < eventIds.length; i += batchSize) {
+        const batch = eventIds.slice(i, i + batchSize);
+        const { data, error } = await db
+            .from('events')
+            .select('*, markets(*)')
+            .in('polymarket_event_id', batch)
+            .eq('active', true)
+            .eq('closed', false);
+        if (error) {
+            log.error('getEventsByPolymarketIds failed', error.message);
+            continue;
+        }
+        if (data) events.push(...data);
     }
-    if (!hotEvents || hotEvents.length === 0) return [];
-    // Step 2: filter to events that have at least one high-price open market
-    return hotEvents
+    return events
         .map(event => ({
             ...event,
-            markets: (event.markets || []).filter(m =>
-                m.active && !m.closed &&
-                (parseFloat(m.best_ask) >= threshold || parseFloat(m.last_trade_price) >= threshold)
-            ),
+            markets: (event.markets || []).filter(m => m.active && !m.closed),
         }))
         .filter(event => event.markets.length > 0);
 }
