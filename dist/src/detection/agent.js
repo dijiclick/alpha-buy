@@ -11,8 +11,13 @@ const _bridges = [];
 function spawnBridge(token, index) {
     log.info(`Spawning bridge #${index}...`);
 
+    // uv uses `uv run --script bridge.py --server`, others use `python3 bridge.py --server`
+    const args = config.PYTHON_CMD === 'uv'
+        ? ['run', '--script', config.PERPLEXITY_BRIDGE_PATH, '--server']
+        : [config.PERPLEXITY_BRIDGE_PATH, '--server'];
+
     const child = spawn(config.PYTHON_CMD,
-        ['run', '--script', config.PERPLEXITY_BRIDGE_PATH, '--server'],
+        args,
         {
             env: { ...process.env, PERPLEXITY_SESSION_TOKEN: token },
             stdio: ['pipe', 'pipe', 'pipe'],

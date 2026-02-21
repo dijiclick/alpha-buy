@@ -1,7 +1,7 @@
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
 import { normalize } from '../util/normalize.js';
-import { upsertEvent, upsertMarket } from '../db/supabase.js';
+import { upsertEventsBatch, upsertMarketsBatch } from '../db/supabase.js';
 const log = createLogger('backfill');
 export async function backfill(state) {
     log.info('Starting backfill of all non-crypto events...');
@@ -30,8 +30,11 @@ export async function backfill(state) {
             break;
         }
         log.info(`Backfill page ${page}: ${events.length} events (offset ${offset})`);
+        // Collect event rows and market rows per page (same pattern as syncer)
+        const eventRows = [];
+        const eventIdToMarkets = new Map();
         for (const event of events) {
-            const eventRow = {
+            eventRows.push({
                 polymarket_event_id: event.id,
                 title: event.title,
                 description: event.description,
@@ -46,16 +49,11 @@ export async function backfill(state) {
                 closed: event.closed ?? false,
                 markets_count: event.markets?.length || 0,
                 total_volume: event.volume || 0,
-            };
-            const eventDbId = await upsertEvent(eventRow);
-            if (!eventDbId)
-                continue;
-            state.knownEventIds.add(event.id);
-            totalEvents++;
+            });
+            const marketRows = [];
             for (const mkt of event.markets || []) {
                 const qNorm = normalize(mkt.question);
-                const marketRow = {
-                    event_id: eventDbId,
+                marketRows.push({
                     polymarket_market_id: mkt.id,
                     condition_id: mkt.conditionId,
                     question_id: mkt.questionID,
@@ -80,20 +78,46 @@ export async function backfill(state) {
                     closed: mkt.closed ?? false,
                     accepting_orders: mkt.acceptingOrders ?? true,
                     neg_risk: mkt.negRisk ?? false,
-                };
-                await upsertMarket(marketRow);
+                });
+            }
+            eventIdToMarkets.set(event.id, marketRows);
+        }
+        // Batch upsert events → get DB IDs
+        const eventIdMap = await upsertEventsBatch(eventRows);
+        // Assign event_id FK to market rows
+        const allMarketRows = [];
+        for (const [polyEventId, marketRows] of eventIdToMarkets) {
+            const dbEventId = eventIdMap.get(polyEventId);
+            if (!dbEventId) continue;
+            for (const mr of marketRows) {
+                mr.event_id = dbEventId;
+                allMarketRows.push(mr);
+            }
+        }
+        // Batch upsert markets
+        await upsertMarketsBatch(allMarketRows);
+        // Update in-memory state
+        for (const event of events) {
+            state.knownEventIds.add(event.id);
+            totalEvents++;
+            for (const mkt of event.markets || []) {
+                const qNorm = normalize(mkt.question);
                 state.knownMarketIds.add(mkt.id);
                 state.marketsByQuestion.set(qNorm, mkt.id);
                 totalMarkets++;
+                // Build token→event cache for WebSocket
+                const tokenIds = parseJsonSafe(mkt.clobTokenIds, null);
+                if (Array.isArray(tokenIds) && tokenIds[0] && state.tokenToEventId) {
+                    state.tokenToEventId.set(tokenIds[0], event.id);
+                }
             }
         }
         offset += events.length;
-        // Rate limit: ~2 req/s to be safe
-        await sleep(500);
+        await sleep(200);
     }
     state.backfillComplete = true;
     state.persist();
-    log.info(`Backfill complete: ${totalEvents} events, ${totalMarkets} markets`);
+    log.info(`Backfill complete: ${totalEvents} events, ${totalMarkets} markets, ${state.tokenToEventId?.size || 0} tokens cached`);
 }
 function parseJsonSafe(str, fallback) {
     if (!str)
