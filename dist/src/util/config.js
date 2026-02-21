@@ -14,10 +14,13 @@ function getPerplexityTokens() {
     const tokens = [];
     const primary = process.env.PERPLEXITY_SESSION_TOKEN;
     if (!primary) throw new Error('Missing env: PERPLEXITY_SESSION_TOKEN');
-    tokens.push(primary);
+    const primarySlots = parseInt(process.env.PERPLEXITY_SESSION_TOKEN_SLOTS) || 1;
+    for (let s = 0; s < primarySlots; s++) tokens.push(primary);
     for (let i = 2; i <= 10; i++) {
         const t = process.env[`PERPLEXITY_SESSION_TOKEN_${i}`];
-        if (t) tokens.push(t);
+        if (!t) continue;
+        const slots = parseInt(process.env[`PERPLEXITY_SESSION_TOKEN_${i}_SLOTS`]) || 1;
+        for (let s = 0; s < slots; s++) tokens.push(t);
     }
     return tokens;
 }
