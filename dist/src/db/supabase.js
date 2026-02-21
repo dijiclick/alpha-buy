@@ -93,22 +93,6 @@ export async function upsertOutcome(row) {
         .select('id')
         .single();
     if (error) {
-        // If columns don't exist yet (pre-migration), retry without them
-        if (error.message?.toLowerCase().includes('could not find') && error.message?.toLowerCase().includes('column')) {
-            const safe = { ...payload };
-            delete safe.estimated_end_min;
-            delete safe.estimated_end_max;
-            const { data: d2, error: e2 } = await db
-                .from('outcomes')
-                .upsert(safe, { onConflict: 'market_id' })
-                .select('id')
-                .single();
-            if (e2) {
-                log.error(`upsert outcome for market ${row.market_id} failed`, e2.message);
-                return null;
-            }
-            return d2?.id ?? null;
-        }
         log.error(`upsert outcome for market ${row.market_id} failed`, error.message);
         return null;
     }

@@ -4,7 +4,7 @@ const log = createLogger('state');
 const STATE_FILE = 'state.json';
 export class State {
     trackedEvents = new Map(); // eventId → { title, marketCount, estimatedEnd, lastChecked, checkCount, nextCheckAt }
-    resolvedEventIds = new Set(); // eventIds already resolved (skip re-checking)
+    resolvedEventIds = new Map(); // eventId → resolvedAt timestamp
     knownEventIds = new Set();
     knownMarketIds = new Set();
     marketsByQuestion = new Map(); // normalizedQuestion → marketId
@@ -27,9 +27,22 @@ export class State {
                 this.marketsByQuestion.set(q, id);
             for (const [id, entry] of data.trackedEvents || [])
                 this.trackedEvents.set(id, entry);
-            for (const id of data.resolvedEventIds || [])
-                this.resolvedEventIds.add(id);
-            log.info(`State loaded: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets, ${this.trackedEvents.size} tracked, ${this.resolvedEventIds.size} resolved, backfill=${this.backfillComplete}`);
+            for (const entry of data.resolvedEventIds || []) {
+                if (Array.isArray(entry))
+                    this.resolvedEventIds.set(entry[0], entry[1]);
+                else
+                    this.resolvedEventIds.set(entry, Date.now()); // backwards compat
+            }
+            // Prune entries older than 7 days
+            const cutoff = Date.now() - 7 * 86400000;
+            let pruned = 0;
+            for (const [id, ts] of this.resolvedEventIds) {
+                if (ts < cutoff) { this.resolvedEventIds.delete(id); pruned++; }
+            }
+            if (pruned > 0) log.info(`Pruned ${pruned} resolved events older than 7 days`);
+            for (const [tok, evtId] of data.tokenToEventId || [])
+                this.tokenToEventId.set(tok, evtId);
+            log.info(`State loaded: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets, ${this.trackedEvents.size} tracked, ${this.resolvedEventIds.size} resolved, ${this.tokenToEventId.size} tokens, backfill=${this.backfillComplete}`);
         }
         catch (e) {
             log.error('Failed to load state.json', e.message);
@@ -43,7 +56,8 @@ export class State {
                 knownMarketIds: [...this.knownMarketIds],
                 marketsByQuestion: [...this.marketsByQuestion.entries()],
                 trackedEvents: [...this.trackedEvents.entries()],
-                resolvedEventIds: [...this.resolvedEventIds],
+                resolvedEventIds: [...this.resolvedEventIds.entries()],
+                tokenToEventId: [...this.tokenToEventId.entries()],
             };
             writeFileSync(STATE_FILE, JSON.stringify(data));
             log.debug(`State persisted: ${this.knownEventIds.size} events, ${this.knownMarketIds.size} markets, ${this.trackedEvents.size} tracked events`);

@@ -157,9 +157,12 @@ export function startResolutionAgent(state) {
 }
 
 // Exported so websocket.js can trigger immediate checks
+let _wsSlot = 0;
 export async function checkAndProcessEvent(event, state) {
-    // Use bridge slot 0 for WebSocket-triggered checks
-    return processEvent(event, state.trackedEvents.get(event.polymarket_event_id), 0, state, _counters);
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
+    const slot = _wsSlot % concurrency;
+    _wsSlot++;
+    return processEvent(event, state.trackedEvents.get(event.polymarket_event_id), slot, state, _counters);
 }
 
 const _counters = { newTracked: 0, rechecked: 0, resolved: 0 };
@@ -250,17 +253,16 @@ async function runHotLoop(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
     const now = Date.now();
     const HOT_LOOKBACK = 20 * 60_000;  // 20min ago
-    const HOT_LOOKAHEAD = 10 * 60_000; // 10min from now
 
-    // Scan tracked events for those whose estimatedEndMin is in the hot zone
+    // Scan tracked events for those whose estimatedEndMin has PASSED (only check after it ends)
     const hotEventIds = [];
     for (const [eventId, tracked] of state.trackedEvents) {
         if (!tracked.estimatedEndMin) continue;
         const endTime = new Date(tracked.estimatedEndMin).getTime();
         if (isNaN(endTime)) continue;
-        const remaining = endTime - now;
-        // Hot zone: ended within 20min or ending within 10min
-        if (remaining >= -HOT_LOOKBACK && remaining <= HOT_LOOKAHEAD) {
+        const elapsed = now - endTime;
+        // Only events that ended between 0 and 20min ago
+        if (elapsed > 0 && elapsed <= HOT_LOOKBACK) {
             hotEventIds.push(eventId);
         }
     }
@@ -283,18 +285,14 @@ async function runHotLoop(state) {
 
     if (queue.length === 0) return;
 
-    // Sort: past estimatedEndMin first, then nearest future
+    // Sort: most recently ended first (smallest elapsed time)
     queue.sort((a, b) => {
         const aEnd = new Date(a.tracked.estimatedEndMin).getTime();
         const bEnd = new Date(b.tracked.estimatedEndMin).getTime();
-        const aRemaining = aEnd - now;
-        const bRemaining = bEnd - now;
-        if (aRemaining <= 0 && bRemaining > 0) return -1;
-        if (bRemaining <= 0 && aRemaining > 0) return 1;
-        return aRemaining - bRemaining;
+        return bEnd - aEnd; // newest end first
     });
 
-    log.info(`Hot: ${queue.length} events near estimatedEnd (Perplexity-based)`);
+    log.info(`Hot: ${queue.length} events just ended (checking for resolution)`);
 
     const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
@@ -333,7 +331,7 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
                 const live = await gmRes.json();
                 if (live.closed) {
                     log.info(`SKIP (closed on PM): "${event.title.slice(0, 60)}"`);
-                    state.resolvedEventIds.add(eventId);
+                    state.resolvedEventIds.set(eventId, Date.now());
                     return;
                 }
             }
@@ -347,7 +345,7 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
         if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
             await writeEventResults(event, result);
             state.trackedEvents.delete(eventId);
-            state.resolvedEventIds.add(eventId);
+            state.resolvedEventIds.set(eventId, Date.now());
             counters.resolved++;
         }
         else {
@@ -374,7 +372,7 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
         if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
             await writeEventResults(event, result);
             state.trackedEvents.delete(eventId);
-            state.resolvedEventIds.add(eventId);
+            state.resolvedEventIds.set(eventId, Date.now());
             counters.resolved++;
             log.info(`RESOLVED after ${tracked.checkCount} checks: "${event.title.slice(0, 80)}" → ${result.answer}`);
         }
@@ -391,19 +389,24 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
 }
 
 function calculateNextCheck(estimatedEndISO, checkCount = 0) {
-    const MIN_INTERVAL = 10 * 60 * 1000;
-
     if (!estimatedEndISO) return Date.now() + config.DETECTION_INTERVAL;
 
     const endTime = new Date(estimatedEndISO).getTime();
-    const remaining = endTime - Date.now();
+    const now = Date.now();
+    const remaining = endTime - now;
 
-    if (remaining <= 0) return Date.now() + MIN_INTERVAL;
-    if (remaining <= 60 * 60 * 1000) return Date.now() + MIN_INTERVAL;
-    if (remaining <= 4 * 60 * 60 * 1000) return Date.now() + 30 * 60 * 1000;
-    if (remaining <= 24 * 60 * 60 * 1000) return Date.now() + 2 * 60 * 60 * 1000;
-    if (remaining <= 3 * 24 * 60 * 60 * 1000) return Date.now() + 6 * 60 * 60 * 1000;
-    return endTime - 24 * 60 * 60 * 1000;
+    // Event hasn't ended yet → don't check before it ends, schedule at endTime + 1min
+    if (remaining > 0) {
+        if (remaining > 3 * 24 * 3600000) return endTime - 24 * 3600000; // >3d: wake 24h before
+        if (remaining > 24 * 3600000) return now + 6 * 3600000;          // 1-3d: every 6h
+        if (remaining > 4 * 3600000) return now + 2 * 3600000;           // 4-24h: every 2h
+        return endTime + 60000;                                           // <4h: wait until endTime + 1min
+    }
+
+    // Event already ended → recheck with escalating backoff
+    const POST_INTERVALS = [60000, 2 * 60000, 5 * 60000, 10 * 60000]; // 1m, 2m, 5m, 10m
+    const idx = Math.min(checkCount, POST_INTERVALS.length - 1);
+    return now + POST_INTERVALS[idx];
 }
 
 // ─── Perplexity bridge ───

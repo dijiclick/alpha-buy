@@ -1,7 +1,7 @@
 import WebSocket from 'ws';
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
-import { getAllActiveTokenIds, getEventByMarketTokenId } from '../db/supabase.js';
+import { getAllActiveTokenIds, getEventsByPolymarketIds } from '../db/supabase.js';
 import { checkAndProcessEvent } from './agent.js';
 const log = createLogger('ws');
 
@@ -156,7 +156,12 @@ async function triggerCheck(tokenId, state, reason) {
     }
 
     try {
-        const event = await getEventByMarketTokenId(tokenId);
+        // Fast path: in-memory cache (O(1) vs DB LIKE scan)
+        const eventId = state.tokenToEventId?.get(tokenId);
+        if (!eventId) return;
+
+        const events = await getEventsByPolymarketIds([eventId]);
+        const event = events[0];
         if (!event || !event.markets || event.markets.length === 0) return;
 
         log.info(`WS TRIGGER [${reason}]: "${event.title.slice(0, 60)}" — checking with Perplexity`);

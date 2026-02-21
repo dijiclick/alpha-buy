@@ -46,8 +46,8 @@ async function syncEvents(state, quickMode) {
 
     while (true) {
         page++;
-        // Quick mode: newest 50, one page only
-        const limit = quickMode ? 50 : config.GAMMA_PAGE_SIZE;
+        // Quick mode: newest 200, one page only
+        const limit = quickMode ? 200 : config.GAMMA_PAGE_SIZE;
         const orderParam = quickMode ? '&order=id&ascending=false' : '';
         const url = `${config.GAMMA_BASE}/events?exclude_tag_id=${config.CRYPTO_TAG_ID}&limit=${limit}&offset=${offset}&active=true&closed=false${orderParam}`;
 
