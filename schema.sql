@@ -60,5 +60,6 @@ CREATE TABLE IF NOT EXISTS outcomes (
   estimated_end_min timestamptz,
   estimated_end_max timestamptz,
   is_resolved boolean DEFAULT false,
+  profit_pct numeric,
   updated_at timestamptz DEFAULT now()
 );

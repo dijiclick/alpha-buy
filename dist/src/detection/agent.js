@@ -370,11 +370,47 @@ async function writeEventResults(event, result) {
 
     if (alertMarket) {
         log.info(`MAPPED: "${event.title.slice(0, 60)}" → "${alertMarket.market.question.slice(0, 60)}" = YES (${alertMarket.confidence}%)`);
-        // For resolved events, use implied prices (YES→1.00, NO→0.00) instead of fetching from dead order books
-        const prices = result.resolved
-            ? { type: 'resolved', yes: '1.00', no: '0.00' }
-            : await fetchPrices(alertMarket.market);
-        await sendTelegramAlert(event, alertMarket.market, { ...result, outcome: 'yes' }, prices);
+
+        // Skip if market already resolved on Polymarket (no opportunity)
+        if (alertMarket.market.condition_id) {
+            try {
+                const gmRes = await fetch(`${config.GAMMA_BASE}/markets/${alertMarket.market.condition_id}`);
+                if (gmRes.ok) {
+                    const live = await gmRes.json();
+                    if (live.closed) {
+                        log.info(`SKIP: "${alertMarket.market.question.slice(0, 60)}" already closed on Polymarket`);
+                        return;
+                    }
+                }
+            } catch (e) {
+                log.warn(`Gamma check failed for "${alertMarket.market.question.slice(0, 40)}"`, e.message);
+            }
+        }
+
+        // Always try real prices first (for profit calc), fall back to implied for resolved
+        const realPrices = await fetchPrices(alertMarket.market);
+        const prices = realPrices || (result.resolved ? { type: 'resolved', yes: '1.00', no: '0.00' } : null);
+
+        // Calculate profit % for resolved events with live prices
+        let profitPct = null;
+        if (result.resolved && prices && prices.type !== 'resolved') {
+            const buyPrice = prices.type === 'book'
+                ? parseFloat(prices.yesAsk)
+                : parseFloat(prices.yes);
+            if (!isNaN(buyPrice) && buyPrice > 0 && buyPrice < 1) {
+                profitPct = ((1.00 - buyPrice) / buyPrice) * 100;
+            }
+        }
+
+        // Store profit_pct in DB
+        if (profitPct !== null && alertMarket.market.id) {
+            await upsertOutcome({
+                market_id: alertMarket.market.id,
+                profit_pct: Math.round(profitPct * 100) / 100,
+            });
+        }
+
+        await sendTelegramAlert(event, alertMarket.market, { ...result, outcome: 'yes' }, prices, profitPct);
     } else {
         log.warn(`NO YES: "${event.title.slice(0, 60)}" answer="${result.answer}"`);
     }
@@ -501,7 +537,7 @@ function shortQuestion(q, eventTitle) {
     return q.length > 50 ? q.slice(0, 47) + '...' : q;
 }
 
-async function sendTelegramAlert(event, market, result, prices) {
+async function sendTelegramAlert(event, market, result, prices, profitPct) {
     if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) return;
 
     const eventUrl = `https://polymarket.com/event/${event.slug || ''}`;
@@ -544,6 +580,13 @@ async function sendTelegramAlert(event, market, result, prices) {
         } else {
             lines.push(`💰 YES <b>${prices.yes}</b>  ·  NO <b>${prices.no}</b>`);
         }
+    }
+
+    if (profitPct !== null && profitPct !== undefined) {
+        const buyPrice = prices?.type === 'book'
+            ? prices.yesAsk
+            : prices?.yes;
+        lines.push(`📈 <b>Profit: ~${profitPct.toFixed(2)}%</b>  (buy YES @ ${buyPrice} → 1.00)`);
     }
 
     if (!result.resolved) {
