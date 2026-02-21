@@ -38,16 +38,10 @@ async function main() {
     startPriceStream(state);
     // Phase 4: Periodic state persistence
     setInterval(() => state.persist(), config.STATE_PERSIST_INTERVAL);
-    // Phase 5: Status reporting
+    // Phase 5: Status reporting (summary only, no per-event spam)
     setInterval(() => {
         const s = state.stats();
         log.info(`STATUS: events=${s.events} markets=${s.markets} tracked=${s.tracked} resolved=${s.resolved}`);
-        if (state.trackedEvents.size > 0) {
-            for (const [, t] of state.trackedEvents) {
-                const next = t.nextCheckAt ? new Date(t.nextCheckAt).toISOString() : 'unknown';
-                log.info(`  TRACKING: "${t.title.slice(0, 70)}" (${t.marketCount} mkts) checks=${t.checkCount} next=${next}`);
-            }
-        }
     }, config.STATUS_REPORT_INTERVAL);
     // Graceful shutdown
     const shutdown = () => {

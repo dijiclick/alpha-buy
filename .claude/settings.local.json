@@ -5,7 +5,8 @@
       "Bash(git -C \"e:\\\\Doing\\\\alpha buy\" log --oneline -15)",
       "Bash(git -C \"e:\\\\Doing\\\\alpha buy\" show ab8a8b4 --stat)",
       "WebFetch(domain:api.github.com)",
-      "WebFetch(domain:gamma-api.polymarket.com)"
+      "WebFetch(domain:gamma-api.polymarket.com)",
+      "Bash(git log:*)"
     ]
   }
 }

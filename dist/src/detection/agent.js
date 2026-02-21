@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
-import { getHighPriceEvents, upsertOutcome } from '../db/supabase.js';
+import { getHighPriceEvents, getHotEvents, upsertOutcome } from '../db/supabase.js';
 const log = createLogger('agent');
 
 // ─── Bridge pool (one process per session token) ───
@@ -40,9 +40,8 @@ function spawnBridge(token, index) {
         if (!msg) return;
         if (/RATE_LIMITED|SESSION_ERR|ERROR|FAILED/i.test(msg)) {
             log.warn(`Bridge#${index}: ${msg.slice(0, 500)}`);
-        } else {
-            log.info(`Bridge#${index}: ${msg.slice(0, 300)}`);
         }
+        // Skip verbose REQ/OK/STATS lines from bridge stderr
     });
 
     const b = {
@@ -127,6 +126,8 @@ function getBridge(slotIndex) {
 export function startResolutionAgent(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
     log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s, ${concurrency} bridges, price_threshold=${config.PRICE_SPIKE_THRESHOLD})`);
+
+    // Full discovery scan (hourly)
     const run = async () => {
         try {
             await runAgentCycle(state);
@@ -137,6 +138,22 @@ export function startResolutionAgent(state) {
     };
     run();
     setInterval(run, config.DETECTION_INTERVAL);
+
+    // Hot loop: check events ending NOW every 2 min
+    let hotRunning = false;
+    const hot = async () => {
+        if (hotRunning) return; // skip if previous hot loop still running
+        hotRunning = true;
+        try {
+            await runHotLoop(state);
+        } catch (e) {
+            log.error('Hot loop failed', e.message);
+        } finally {
+            hotRunning = false;
+        }
+    };
+    setTimeout(hot, 30_000); // first hot run 30s after start
+    setInterval(hot, 2 * 60_000);
 }
 
 // Exported so websocket.js can trigger immediate checks
@@ -156,6 +173,10 @@ async function runAgentCycle(state) {
     // Build work queue
     const queue = [];
     let skippedResolved = 0;
+    let skippedFuture = 0;
+    const now = Date.now();
+    const horizon = config.END_DATE_HORIZON;
+
     for (const event of events) {
         if (event.closed || !event.markets || event.markets.length === 0)
             continue;
@@ -168,19 +189,33 @@ async function runAgentCycle(state) {
             continue;
         }
 
+        // Skip events whose end_date is far in the future (not ending soon)
+        if (event.end_date) {
+            const endTime = new Date(event.end_date).getTime();
+            if (!isNaN(endTime) && endTime - now > horizon) {
+                skippedFuture++;
+                continue;
+            }
+        }
+
         const tracked = state.trackedEvents.get(eventId);
 
         if (!tracked) {
             queue.push({ event, tracked: null });
         }
-        else if (Date.now() >= tracked.nextCheckAt) {
+        else if (now >= tracked.nextCheckAt) {
             queue.push({ event, tracked });
         }
     }
 
-    if (queue.length === 0) return;
+    if (queue.length === 0) {
+        if (skippedFuture > 0 || skippedResolved > 0) {
+            log.info(`Agent: nothing to check. ${skippedResolved} resolved, ${skippedFuture} future (>${Math.round(horizon / 3_600_000)}h away)`);
+        }
+        return;
+    }
 
-    log.info(`Agent: ${queue.length} to check (≥${config.PRICE_SPIKE_THRESHOLD}), ${skippedResolved} already resolved, ${concurrency} bridges`);
+    log.info(`Agent: ${queue.length} to check (≥${config.PRICE_SPIKE_THRESHOLD}), ${skippedResolved} resolved, ${skippedFuture} future, ${concurrency} bridges`);
 
     const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
@@ -207,6 +242,64 @@ async function runAgentCycle(state) {
         log.info(`Agent: ${counters.newTracked} new, ${counters.rechecked} re-checked, ${counters.resolved} resolved, ${total} tracking`);
     }
 }
+
+// ─── Hot loop: events ending NOW (every 2 min) ───
+
+async function runHotLoop(state) {
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
+    const events = await getHotEvents(config.PRICE_SPIKE_THRESHOLD);
+    const now = Date.now();
+
+    // Filter & sort: past end_date first (most urgent), then nearest future
+    const queue = [];
+    for (const event of events) {
+        if (event.closed || !event.markets?.length) continue;
+        const eventId = event.polymarket_event_id;
+        if (state.resolvedEventIds.has(eventId)) continue;
+        const tracked = state.trackedEvents.get(eventId);
+        queue.push({ event, tracked: tracked || null });
+    }
+
+    if (queue.length === 0) return;
+
+    // Sort: past end_date first, then by proximity to now
+    queue.sort((a, b) => {
+        const aEnd = new Date(a.event.end_date).getTime();
+        const bEnd = new Date(b.event.end_date).getTime();
+        const aRemaining = aEnd - now;
+        const bRemaining = bEnd - now;
+        // Past events first (negative remaining), then nearest future
+        if (aRemaining <= 0 && bRemaining > 0) return -1;
+        if (bRemaining <= 0 && aRemaining > 0) return 1;
+        return aRemaining - bRemaining;
+    });
+
+    log.info(`Hot: ${queue.length} events in zone (ending within 1h or ended <6h ago)`);
+
+    const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
+
+    async function worker(slotIndex) {
+        while (queue.length > 0) {
+            const item = queue.shift();
+            if (!item) break;
+            try {
+                await processEvent(item.event, item.tracked, slotIndex, state, counters);
+            } catch (e) {
+                log.error(`Hot#${slotIndex} error: ${e.message}`);
+            }
+        }
+    }
+
+    await Promise.all(
+        Array.from({ length: Math.min(concurrency, queue.length) }, (_, i) => worker(i))
+    );
+
+    if (counters.resolved > 0 || counters.newTracked > 0) {
+        log.info(`Hot: ${counters.newTracked} new, ${counters.rechecked} re-checked, ${counters.resolved} resolved`);
+    }
+}
+
+// ─── Event processing ───
 
 async function processEvent(event, tracked, slotIndex, state, counters) {
     const eventId = event.polymarket_event_id;
