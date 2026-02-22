@@ -76,6 +76,10 @@ async function syncEvents(state, quickMode) {
         for (const event of events) {
             allGammaEventIds.add(event.id);
 
+            // Skip blocked tag categories (e.g. soccer)
+            const tags = event.tags || [];
+            if (tags.some(t => config.BLOCKED_TAG_SLUGS.has(t.slug))) continue;
+
             eventRows.push({
                 polymarket_event_id: event.id,
                 title: event.title,

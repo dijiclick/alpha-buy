@@ -1,12 +1,27 @@
 import { spawn } from 'child_process';
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
-import { getHighPriceEvents, getEventsByPolymarketIds, upsertOutcome } from '../db/supabase.js';
+import { getAllOpenEvents, getEventsByPolymarketIds, upsertOutcome, updateEventLastChecked } from '../db/supabase.js';
 const log = createLogger('agent');
 
 // ─── Bridge pool (one process per session token) ───
 
 const _bridges = [];
+const DEFAULT_HOT_LOOP_INTERVAL_MS = 60_000;
+const DEFAULT_HOT_LOOKBACK_MS = 20 * 60_000;
+const DEFAULT_INITIAL_POST_END_DELAY_MS = 75_000;
+
+function readMsEnv(name, fallback) {
+    const v = Number(process.env[name]);
+    return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
+const HOT_LOOP_INTERVAL_MS = readMsEnv('HOT_LOOP_INTERVAL_MS', DEFAULT_HOT_LOOP_INTERVAL_MS);
+const HOT_LOOKBACK_MS = readMsEnv('HOT_LOOKBACK_MS', DEFAULT_HOT_LOOKBACK_MS);
+const INITIAL_POST_END_DELAY_MS = Math.min(
+    90_000,
+    Math.max(60_000, readMsEnv('INITIAL_POST_END_DELAY_MS', DEFAULT_INITIAL_POST_END_DELAY_MS))
+);
 
 function spawnBridge(token, index) {
     log.info(`Spawning bridge #${index}...`);
@@ -130,21 +145,30 @@ function getBridge(slotIndex) {
 
 export function startResolutionAgent(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
-    log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s, ${concurrency} bridges, price_threshold=${config.PRICE_SPIKE_THRESHOLD})`);
+    log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s, hot=${HOT_LOOP_INTERVAL_MS / 1000}s, first_post_end_delay=${INITIAL_POST_END_DELAY_MS / 1000}s, ${concurrency} bridges)`);
 
     // Full discovery scan (hourly)
+    let cycleRunning = false;
     const run = async () => {
+        if (cycleRunning) {
+            log.warn('Agent cycle still running, skipping this tick');
+            return;
+        }
+        cycleRunning = true;
         try {
             await runAgentCycle(state);
         }
         catch (e) {
             log.error('Agent cycle failed', e.message);
         }
+        finally {
+            cycleRunning = false;
+        }
     };
     run();
     setInterval(run, config.DETECTION_INTERVAL);
 
-    // Hot loop: check events ending NOW every 2 min
+    // Hot loop: checks just-ended tracked events
     let hotRunning = false;
     const hot = async () => {
         if (hotRunning) return; // skip if previous hot loop still running
@@ -157,8 +181,8 @@ export function startResolutionAgent(state) {
             hotRunning = false;
         }
     };
-    setTimeout(hot, 30_000); // first hot run 30s after start
-    setInterval(hot, 2 * 60_000);
+    setTimeout(hot, Math.min(30_000, HOT_LOOP_INTERVAL_MS));
+    setInterval(hot, HOT_LOOP_INTERVAL_MS);
 }
 
 // Exported so websocket.js can trigger immediate checks
@@ -172,16 +196,66 @@ export async function checkAndProcessEvent(event, state) {
 
 const _counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
+function toFiniteNumber(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : null;
+}
+
+function getYesPrice(market) {
+    // Prefer explicit YES-like fields, then fallback to the first outcome price.
+    const directCandidates = [
+        market.best_ask,
+        market.last_trade_price,
+        market.bestAsk,
+        market.lastTradePrice,
+        market.yes_price,
+        market.yesPrice,
+        market.yes,
+    ];
+    for (const val of directCandidates) {
+        const n = toFiniteNumber(val);
+        if (n !== null) return n;
+    }
+
+    let prices = market.outcome_prices;
+    if (typeof prices === 'string') {
+        try {
+            prices = JSON.parse(prices);
+        } catch {
+            prices = null;
+        }
+    }
+
+    if (Array.isArray(prices) && prices.length > 0) {
+        const yesIdx = Array.isArray(market.outcomes)
+            ? market.outcomes.findIndex(o => String(o).toLowerCase() === 'yes')
+            : -1;
+        const idx = yesIdx >= 0 ? yesIdx : 0;
+        const n = toFiniteNumber(prices[idx]);
+        if (n !== null) return n;
+    }
+
+    return null;
+}
+
+function eventHasHotPrice(event, threshold) {
+    return (event.markets || []).some(m => {
+        const price = getYesPrice(m);
+        return price !== null && price >= threshold;
+    });
+}
+
 async function runAgentCycle(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
 
-    // Price-first filter: only events with a market priced ≥ threshold
-    const events = await getHighPriceEvents(config.PRICE_SPIKE_THRESHOLD);
+    // Get all open events, then apply price-first gate for untracked events.
+    const events = await getAllOpenEvents();
 
     // Build work queue
     const queue = [];
     let skippedResolved = 0;
     let skippedFuture = 0;
+    let skippedBelowPrice = 0;
     const now = Date.now();
     const horizon = config.END_DATE_HORIZON;
 
@@ -209,6 +283,10 @@ async function runAgentCycle(state) {
         const tracked = state.trackedEvents.get(eventId);
 
         if (!tracked) {
+            if (!eventHasHotPrice(event, config.PRICE_SPIKE_THRESHOLD)) {
+                skippedBelowPrice++;
+                continue;
+            }
             queue.push({ event, tracked: null });
         }
         else if (now >= tracked.nextCheckAt) {
@@ -217,13 +295,13 @@ async function runAgentCycle(state) {
     }
 
     if (queue.length === 0) {
-        if (skippedFuture > 0 || skippedResolved > 0) {
-            log.info(`Agent: nothing to check. ${skippedResolved} resolved, ${skippedFuture} future (>${Math.round(horizon / 3_600_000)}h away)`);
+        if (skippedFuture > 0 || skippedResolved > 0 || skippedBelowPrice > 0) {
+            log.info(`Agent: nothing to check. ${skippedResolved} resolved, ${skippedFuture} future (>${Math.round(horizon / 3_600_000)}h away), ${skippedBelowPrice} below price threshold`);
         }
         return;
     }
 
-    log.info(`Agent: ${queue.length} to check (≥${config.PRICE_SPIKE_THRESHOLD}), ${skippedResolved} resolved, ${skippedFuture} future, ${concurrency} bridges`);
+    log.info(`Agent: ${queue.length} to check, ${skippedResolved} resolved, ${skippedFuture} future, ${skippedBelowPrice} below price threshold, ${concurrency} bridges`);
 
     const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
@@ -257,17 +335,20 @@ async function runAgentCycle(state) {
 async function runHotLoop(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
     const now = Date.now();
-    const HOT_LOOKBACK = 20 * 60_000;  // 20min ago
 
-    // Scan tracked events for those whose estimatedEndMin has PASSED (only check after it ends)
+    // Scan tracked events for those whose estimatedEndMin has passed and are due by nextCheckAt.
     const hotEventIds = [];
     for (const [eventId, tracked] of state.trackedEvents) {
         if (!tracked.estimatedEndMin) continue;
         const endTime = new Date(tracked.estimatedEndMin).getTime();
         if (isNaN(endTime)) continue;
+        const nextCheckAt = Number.isFinite(Number(tracked.nextCheckAt))
+            ? Number(tracked.nextCheckAt)
+            : (endTime + INITIAL_POST_END_DELAY_MS);
+        if (now < nextCheckAt) continue;
         const elapsed = now - endTime;
-        // Only events that ended between 0 and 20min ago
-        if (elapsed > 0 && elapsed <= HOT_LOOKBACK) {
+        // Only events that ended recently
+        if (elapsed > 0 && elapsed <= HOT_LOOKBACK_MS) {
             hotEventIds.push(eventId);
         }
     }
@@ -352,6 +433,9 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
     const result = await checkEventWithPerplexity(event, slotIndex);
     if (!result) return;
 
+    // Record when this event was last checked by the agent
+    await updateEventLastChecked(eventId);
+
     if (!tracked) {
         if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
             await writeEventResults(event, result);
@@ -370,6 +454,7 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
                 estimatedEndMax: result.estimatedEndMax || null,
                 lastChecked: Date.now(),
                 checkCount: 1,
+                postEndCheckCount: 0,
                 nextCheckAt: nextCheck,
             });
             counters.newTracked++;
@@ -393,30 +478,37 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
                 tracked.estimatedEndMax = result.estimatedEndMax;
                 await writeEventEstimatedEnds(event, result);
             }
-            tracked.nextCheckAt = calculateNextCheck(tracked.estimatedEndMin, tracked.checkCount);
+            const endTime = tracked.estimatedEndMin ? new Date(tracked.estimatedEndMin).getTime() : NaN;
+            if (!isNaN(endTime) && endTime <= Date.now()) {
+                tracked.postEndCheckCount = (tracked.postEndCheckCount || 0) + 1;
+            }
+            else {
+                tracked.postEndCheckCount = 0;
+            }
+            tracked.nextCheckAt = calculateNextCheck(tracked.estimatedEndMin, tracked.postEndCheckCount || 0);
             counters.rechecked++;
         }
     }
 }
 
-function calculateNextCheck(estimatedEndISO, checkCount = 0) {
+function calculateNextCheck(estimatedEndISO, postEndCheckCount = 0) {
     if (!estimatedEndISO) return Date.now() + config.DETECTION_INTERVAL;
 
     const endTime = new Date(estimatedEndISO).getTime();
     const now = Date.now();
     const remaining = endTime - now;
 
-    // Event hasn't ended yet → don't check before it ends, schedule at endTime + 1min
+    // Event hasn't ended yet → schedule first confirmation slightly after end.
     if (remaining > 0) {
         if (remaining > 3 * 24 * 3600000) return endTime - 24 * 3600000; // >3d: wake 24h before
         if (remaining > 24 * 3600000) return now + 6 * 3600000;          // 1-3d: every 6h
         if (remaining > 4 * 3600000) return now + 2 * 3600000;           // 4-24h: every 2h
-        return endTime + 60000;                                           // <4h: wait until endTime + 1min
+        return endTime + INITIAL_POST_END_DELAY_MS;                       // <4h: first check ~60-90s after end
     }
 
     // Event already ended → recheck with escalating backoff
     const POST_INTERVALS = [60000, 2 * 60000, 5 * 60000, 10 * 60000]; // 1m, 2m, 5m, 10m
-    const idx = Math.min(checkCount, POST_INTERVALS.length - 1);
+    const idx = Math.min(Math.max(postEndCheckCount - 1, 0), POST_INTERVALS.length - 1);
     return now + POST_INTERVALS[idx];
 }
 

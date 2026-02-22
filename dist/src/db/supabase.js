@@ -188,54 +188,30 @@ export async function closeStaleEvents(activeGammaIds) {
     log.info(`Closed ${staleIds.length} stale events (no longer active on Polymarket)`);
     return staleIds.length;
 }
-export async function getHighPriceEvents(threshold) {
+export async function getAllOpenEvents() {
     const db = getDb();
-    // Get markets where price indicates a likely outcome (≥ threshold)
-    const results = [];
+    const events = [];
     let from = 0;
     const pageSize = 1000;
     while (true) {
         const { data, error } = await db
-            .from('markets')
-            .select('event_id')
-            .eq('active', true)
+            .from('events')
+            .select('*, markets(*)')
             .eq('closed', false)
-            .or(`best_ask.gte.${threshold},last_trade_price.gte.${threshold}`)
             .range(from, from + pageSize - 1);
         if (error) {
-            log.error('getHighPriceEvents failed', error.message);
+            log.error('getAllOpenEvents failed', error.message);
             break;
         }
         if (!data || data.length === 0) break;
-        results.push(...data);
+        events.push(...data);
         if (data.length < pageSize) break;
         from += pageSize;
-    }
-    // Get unique event IDs
-    const eventIds = [...new Set(results.map(r => r.event_id))];
-    if (eventIds.length === 0) return [];
-    // Fetch those events with their markets
-    const events = [];
-    // Supabase .in() has practical limits, batch if needed
-    const batchSize = 100;
-    for (let i = 0; i < eventIds.length; i += batchSize) {
-        const batch = eventIds.slice(i, i + batchSize);
-        const { data, error } = await db
-            .from('events')
-            .select('*, markets(*)')
-            .in('id', batch)
-            .eq('active', true)
-            .eq('closed', false);
-        if (error) {
-            log.error('getHighPriceEvents (events) failed', error.message);
-            continue;
-        }
-        if (data) events.push(...data);
     }
     return events
         .map(event => ({
             ...event,
-            markets: (event.markets || []).filter(m => m.active && !m.closed),
+            markets: (event.markets || []).filter(m => !m.closed),
         }))
         .filter(event => event.markets.length > 0);
 }
@@ -287,6 +263,16 @@ export async function getEventByMarketTokenId(tokenId) {
         ...event,
         markets: (event.markets || []).filter(m => m.active && !m.closed),
     };
+}
+export async function updateEventLastChecked(polymarketEventId) {
+    const db = getDb();
+    const { error } = await db
+        .from('events')
+        .update({ last_checked_at: new Date().toISOString() })
+        .eq('polymarket_event_id', polymarketEventId);
+    if (error) {
+        log.error(`updateEventLastChecked ${polymarketEventId} failed`, error.message);
+    }
 }
 export async function getAllActiveTokenIds() {
     const db = getDb();

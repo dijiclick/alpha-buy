@@ -34,6 +34,10 @@ export async function backfill(state) {
         const eventRows = [];
         const eventIdToMarkets = new Map();
         for (const event of events) {
+            // Skip blocked tag categories (e.g. soccer)
+            const tags = event.tags || [];
+            if (tags.some(t => config.BLOCKED_TAG_SLUGS.has(t.slug))) continue;
+
             eventRows.push({
                 polymarket_event_id: event.id,
                 title: event.title,
@@ -98,6 +102,7 @@ export async function backfill(state) {
         await upsertMarketsBatch(allMarketRows);
         // Update in-memory state
         for (const event of events) {
+            if ((event.tags || []).some(t => config.BLOCKED_TAG_SLUGS.has(t.slug))) continue;
             state.knownEventIds.add(event.id);
             totalEvents++;
             for (const mkt of event.markets || []) {

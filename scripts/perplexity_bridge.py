@@ -278,6 +278,11 @@ def server_mode(session_token):
     client = Perplexity(session_token=session_token)
     log("INFO", "Perplexity client initialized, ready for queries")
 
+    cooldown_base = max(1, int(os.environ.get("PERPLEXITY_RATE_LIMIT_COOLDOWN_SEC", "30")))
+    cooldown_max = max(cooldown_base, int(os.environ.get("PERPLEXITY_RATE_LIMIT_MAX_COOLDOWN_SEC", "300")))
+    rate_limited_until = 0.0
+    consecutive_rate_limits = 0
+
     while True:
         line = sys.stdin.readline()
         if not line:  # EOF — parent closed stdin
@@ -301,6 +306,12 @@ def server_mode(session_token):
             label = input_data.get("question", "?")[:60]
 
         req_num = stats.total_requests + 1
+        now_ts = time.time()
+        if now_ts < rate_limited_until:
+            wait = rate_limited_until - now_ts
+            log("WARN", f"COOLDOWN before req #{req_num}: sleeping {wait:.1f}s")
+            time.sleep(wait)
+
         log("INFO", f"REQ #{req_num} [{mode}] \"{label}\"")
         t0 = time.time()
 
@@ -308,6 +319,8 @@ def server_mode(session_token):
             result = query_perplexity(client, input_data)
             dur = time.time() - t0
             stats.record_ok(dur)
+            consecutive_rate_limits = 0
+            rate_limited_until = 0.0
             log("INFO", f"OK  #{req_num} {dur:.1f}s conf={result.get('confidence', '?')} | {stats.summary()}")
             print(json.dumps(result), flush=True)
 
@@ -324,19 +337,27 @@ def server_mode(session_token):
             stats.record_error(dur, err_type, err_str)
 
             if err_type == "rate_limit":
-                log("ERROR", f"RATE_LIMITED #{req_num} {dur:.1f}s — {err_str[:200]} | {stats.summary()}")
+                consecutive_rate_limits += 1
+                cooldown = min(cooldown_base * (2 ** (consecutive_rate_limits - 1)), cooldown_max)
+                rate_limited_until = time.time() + cooldown
+                log("ERROR", f"RATE_LIMITED #{req_num} {dur:.1f}s — cooldown={cooldown:.0f}s — {err_str[:200]} | {stats.summary()}")
             elif err_type == "session":
+                consecutive_rate_limits = 0
+                rate_limited_until = 0.0
                 log("ERROR", f"SESSION_ERR #{req_num} {dur:.1f}s — {err_str[:200]} | {stats.summary()}")
             else:
+                consecutive_rate_limits = 0
+                rate_limited_until = 0.0
                 log("WARN", f"ERROR #{req_num} {dur:.1f}s [{err_type}] — {err_str[:200]} | {stats.summary()}")
 
-            # Try to recreate client on session/rate errors
-            try:
-                client = Perplexity(session_token=session_token)
-                stats.client_recreations += 1
-                log("INFO", f"Client recreated (#{stats.client_recreations})")
-            except Exception as re_err:
-                log("ERROR", f"Client recreation FAILED: {re_err}")
+            # Recreate client only for session failures.
+            if err_type == "session":
+                try:
+                    client = Perplexity(session_token=session_token)
+                    stats.client_recreations += 1
+                    log("INFO", f"Client recreated (#{stats.client_recreations})")
+                except Exception as re_err:
+                    log("ERROR", f"Client recreation FAILED: {re_err}")
 
             print(json.dumps({"error": err_str}), flush=True)
 

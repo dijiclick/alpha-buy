@@ -44,6 +44,7 @@ export const config = {
     GAMMA_BASE: 'https://gamma-api.polymarket.com',
     // Tag IDs
     CRYPTO_TAG_ID: 21,
+    BLOCKED_TAG_SLUGS: new Set(['soccer', 'basketball', 'ncaa-basketball', 'nba', 'cwbb', 'hockey', 'nhl', 'khl', 'ahl']),
     // Thresholds
     MIN_CONFIDENCE: 80,
     PRICE_SPIKE_THRESHOLD: Number(optEnv('PRICE_SPIKE_THRESHOLD') || '0.85'),
