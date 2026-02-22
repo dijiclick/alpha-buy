@@ -192,6 +192,19 @@ export function startResolutionAgent(state) {
     };
     setTimeout(discover, 60_000); // first run after 1 min
     setInterval(discover, DISCOVERY_INTERVAL);
+
+    // Idle scan: pre-check end times for unchecked events beyond 24h
+    const IDLE_INTERVAL = 10 * 60_000;
+    let idleRunning = false;
+    const idle = async () => {
+        if (idleRunning || cycleRunning) return; // only run when bridges are free
+        idleRunning = true;
+        try { await runIdleScan(state); }
+        catch (e) { log.error('Idle scan failed', e.message); }
+        finally { idleRunning = false; }
+    };
+    setTimeout(idle, 5 * 60_000); // first run after 5 min
+    setInterval(idle, IDLE_INTERVAL);
 }
 
 // Exported so websocket.js can trigger immediate checks
@@ -548,6 +561,97 @@ async function runDiscoveryScan(state) {
 
     if (counters.resolved > 0 || counters.rechecked > 0) {
         log.info(`Discovery: ${counters.rechecked} checked, ${counters.resolved} resolved immediately`);
+    }
+}
+
+// ─── Idle scan: pre-check end times for events beyond 24h ───
+
+async function runIdleScan(state) {
+    const events = await getAllOpenEvents();
+    const now = Date.now();
+    const horizon = config.END_DATE_HORIZON;
+    const candidates = [];
+
+    for (const event of events) {
+        if (event.closed || !event.markets?.length) continue;
+        const eventId = event.polymarket_event_id;
+        if (state.resolvedEventIds.has(eventId)) continue;
+
+        // Skip events already checked by Perplexity
+        const tracked = state.trackedEvents.get(eventId);
+        if (tracked && tracked.checkCount > 0) continue;
+
+        if (!event.end_date) continue;
+        const endTime = new Date(event.end_date).getTime();
+        if (isNaN(endTime) || endTime <= now) continue;
+
+        // Only events BEYOND the 24h horizon (within-horizon handled by discovery scan)
+        if (endTime - now <= horizon) continue;
+
+        candidates.push({ event, endTime });
+    }
+
+    if (candidates.length === 0) return;
+
+    // Sort soonest-ending first (closest to entering the 24h window)
+    candidates.sort((a, b) => a.endTime - b.endTime);
+
+    // With 4 workers @ ~10s/query, 50 events ≈ 2 min of work
+    const MAX_IDLE_BATCH = 50;
+    const batch = candidates.slice(0, MAX_IDLE_BATCH);
+
+    log.info(`Idle: checking ${batch.length} unchecked events for end times (${candidates.length} total unchecked)`);
+
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
+    const reserveSlotForWS = concurrency >= 2;
+    const workerStart = reserveSlotForWS ? 1 : 0;
+    const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
+
+    if (workerCount <= 0) return;
+
+    // Add to tracking so processEvent can handle them
+    for (const { event } of batch) {
+        const eventId = event.polymarket_event_id;
+        if (!state.trackedEvents.has(eventId)) {
+            state.trackedEvents.set(eventId, {
+                eventId,
+                title: event.title,
+                marketCount: event.markets.length,
+                estimatedEndMin: event.end_date,
+                estimatedEndMax: null,
+                lastChecked: 0,
+                checkCount: 0,
+                postEndCheckCount: 0,
+                nextCheckAt: calculateNextCheck(event.end_date, 0),
+            });
+        }
+    }
+
+    const queue = batch.map(({ event }) => ({
+        event,
+        tracked: state.trackedEvents.get(event.polymarket_event_id),
+    }));
+
+    const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
+
+    async function worker(slotIndex) {
+        while (queue.length > 0) {
+            const item = queue.shift();
+            if (!item) break;
+            try {
+                await processEvent(item.event, item.tracked, slotIndex, state, counters);
+            } catch (e) {
+                log.error(`Idle#${slotIndex} error: ${e.message}`);
+            }
+        }
+    }
+
+    await Promise.all(
+        Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
+    );
+
+    if (counters.rechecked > 0 || counters.resolved > 0) {
+        log.info(`Idle: ${counters.rechecked} end times checked, ${counters.resolved} already resolved`);
     }
 }
 
