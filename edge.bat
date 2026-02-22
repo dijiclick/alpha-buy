@@ -5,6 +5,7 @@ cd /d "%~dp0"
 
 if "%EDGE_INTERVAL_SECONDS%"=="" set "EDGE_INTERVAL_SECONDS=300"
 if "%EDGE_RETRY_SECONDS%"=="" set "EDGE_RETRY_SECONDS=20"
+if "%EDGE_TELEGRAM_ENABLED%"=="" set "EDGE_TELEGRAM_ENABLED=true"
 
 if not "%PYTHON_CMD%"=="" (
   %PYTHON_CMD% --version >nul 2>&1
@@ -30,6 +31,15 @@ if /I "%PYTHON_CMD%"=="python" (
     echo [edge.bat] Install once with:
     echo [edge.bat]   python -m pip install perplexity-webui-scraper
     exit /b 2
+  )
+)
+
+if /I not "%EDGE_TELEGRAM_ENABLED%"=="false" (
+  if "%TELEGRAM_BOT_TOKEN%"=="" (
+    echo [edge.bat] WARN: TELEGRAM_BOT_TOKEN not set in shell env. If .env has it, scanner will still send alerts.
+  )
+  if "%TELEGRAM_CHAT_ID%"=="" (
+    echo [edge.bat] WARN: TELEGRAM_CHAT_ID not set in shell env. If .env has it, scanner will still send alerts.
   )
 )
 

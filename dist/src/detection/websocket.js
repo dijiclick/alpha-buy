@@ -142,9 +142,12 @@ async function handleMessage(data, state) {
 async function triggerCheck(tokenId, state, reason) {
     if (!tokenId) return;
 
-    // Cooldown: don't re-check same token within 5 min
-    const lastCheck = _recentChecks.get(tokenId);
-    if (lastCheck && Date.now() - lastCheck < CHECK_COOLDOWN) return;
+    // Bypass cooldown for market_resolved — most authoritative signal
+    const isResolved = reason === 'resolved';
+    if (!isResolved) {
+        const lastCheck = _recentChecks.get(tokenId);
+        if (lastCheck && Date.now() - lastCheck < CHECK_COOLDOWN) return;
+    }
     _recentChecks.set(tokenId, Date.now());
 
     // Clean old entries from cooldown map

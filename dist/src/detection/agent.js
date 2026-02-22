@@ -183,15 +183,21 @@ export function startResolutionAgent(state) {
     };
     setTimeout(hot, Math.min(30_000, HOT_LOOP_INTERVAL_MS));
     setInterval(hot, HOT_LOOP_INTERVAL_MS);
+
+    // Discovery scan: find events entering 24h horizon without Perplexity queries
+    const DISCOVERY_INTERVAL = 15 * 60_000;
+    const discover = async () => {
+        try { await runDiscoveryScan(state); }
+        catch (e) { log.error('Discovery scan failed', e.message); }
+    };
+    setTimeout(discover, 60_000); // first run after 1 min
+    setInterval(discover, DISCOVERY_INTERVAL);
 }
 
 // Exported so websocket.js can trigger immediate checks
-let _wsSlot = 0;
+// Slot 0 is reserved for WS triggers — agent cycle uses slots 1+
 export async function checkAndProcessEvent(event, state) {
-    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
-    const slot = _wsSlot % concurrency;
-    _wsSlot++;
-    return processEvent(event, state.trackedEvents.get(event.polymarket_event_id), slot, state, _counters);
+    return processEvent(event, state.trackedEvents.get(event.polymarket_event_id), 0, state, _counters);
 }
 
 const _counters = { newTracked: 0, rechecked: 0, resolved: 0 };
@@ -301,17 +307,71 @@ async function runAgentCycle(state) {
         return;
     }
 
-    log.info(`Agent: ${queue.length} to check, ${skippedResolved} resolved, ${skippedFuture} future, ${skippedBelowPrice} below price threshold, ${concurrency} bridges`);
+    // Priority sort: already-ended first, then soonest-ending
+    queue.sort((a, b) => {
+        const aEnd = a.event.end_date ? new Date(a.event.end_date).getTime() : Infinity;
+        const bEnd = b.event.end_date ? new Date(b.event.end_date).getTime() : Infinity;
+        const now2 = Date.now();
+        if ((aEnd <= now2) !== (bEnd <= now2)) return aEnd <= now2 ? -1 : 1;
+        return aEnd - bEnd;
+    });
+
+    // Batch Gamma pre-flight: check all markets in parallel before using Perplexity
+    const gammaResults = new Map();
+    const GAMMA_BATCH = 20;
+    for (let i = 0; i < queue.length; i += GAMMA_BATCH) {
+        const batch = queue.slice(i, i + GAMMA_BATCH);
+        const results = await Promise.allSettled(batch.map(async ({ event }) => {
+            const mkt = event.markets?.[0];
+            if (!mkt?.polymarket_market_id) return { id: event.polymarket_event_id, closed: false };
+            try {
+                const res = await fetch(`${config.GAMMA_BASE}/markets/${mkt.polymarket_market_id}`);
+                if (res.ok) {
+                    const live = await res.json();
+                    return { id: event.polymarket_event_id, closed: !!live.closed };
+                }
+                return { id: event.polymarket_event_id, closed: null };
+            } catch {
+                return { id: event.polymarket_event_id, closed: null };
+            }
+        }));
+        for (const r of results) {
+            if (r.status === 'fulfilled' && r.value) {
+                gammaResults.set(r.value.id, r.value.closed);
+            }
+        }
+    }
+
+    // Filter out already-closed events
+    let gammaFiltered = 0;
+    const filteredQueue = queue.filter(({ event }) => {
+        const closed = gammaResults.get(event.polymarket_event_id);
+        if (closed === true) {
+            state.resolvedEventIds.set(event.polymarket_event_id, Date.now());
+            gammaFiltered++;
+            return false;
+        }
+        return true;
+    });
+    // Replace queue contents
+    queue.length = 0;
+    queue.push(...filteredQueue);
+
+    log.info(`Agent: ${queue.length} to check (${gammaFiltered} pre-filtered closed), ${skippedResolved} resolved, ${skippedFuture} future, ${skippedBelowPrice} below price, ${concurrency} bridges`);
 
     const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
-    // Worker function: each worker owns one bridge slot
+    // Reserve slot 0 for WebSocket triggers; agent workers use slots 1+
+    const reserveSlotForWS = concurrency >= 2;
+    const workerStart = reserveSlotForWS ? 1 : 0;
+    const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
+
     async function worker(slotIndex) {
         while (queue.length > 0) {
             const item = queue.shift();
             if (!item) break;
             try {
-                await processEvent(item.event, item.tracked, slotIndex, state, counters);
+                await processEvent(item.event, item.tracked, slotIndex, state, counters, { skipGammaPreflight: true });
             } catch (e) {
                 log.error(`Worker#${slotIndex} processEvent error: ${e.message}`);
             }
@@ -320,7 +380,7 @@ async function runAgentCycle(state) {
     }
 
     await Promise.all(
-        Array.from({ length: Math.min(concurrency, queue.length) }, (_, i) => worker(i))
+        Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
     );
 
     const total = state.trackedEvents.size;
@@ -382,6 +442,11 @@ async function runHotLoop(state) {
 
     const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
+    // Reserve slot 0 for WebSocket triggers; hot loop uses slots 1+
+    const reserveSlotForWS = concurrency >= 2;
+    const workerStart = reserveSlotForWS ? 1 : 0;
+    const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
+
     async function worker(slotIndex) {
         while (queue.length > 0) {
             const item = queue.shift();
@@ -395,7 +460,7 @@ async function runHotLoop(state) {
     }
 
     await Promise.all(
-        Array.from({ length: Math.min(concurrency, queue.length) }, (_, i) => worker(i))
+        Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
     );
 
     if (counters.resolved > 0 || counters.rechecked > 0 || counters.newTracked > 0) {
@@ -403,30 +468,116 @@ async function runHotLoop(state) {
     }
 }
 
+// ─── Discovery scan: lightweight tracking without Perplexity ───
+
+async function runDiscoveryScan(state) {
+    const events = await getAllOpenEvents();
+    const now = Date.now();
+    const horizon = config.END_DATE_HORIZON;
+    const newEvents = [];
+
+    for (const event of events) {
+        if (event.closed || !event.markets?.length) continue;
+        const eventId = event.polymarket_event_id;
+        if (state.resolvedEventIds.has(eventId)) continue;
+        if (state.trackedEvents.has(eventId)) continue;
+
+        if (!event.end_date) continue; // no end_date = can't schedule
+        const endTime = new Date(event.end_date).getTime();
+        if (isNaN(endTime) || endTime - now > horizon) continue;
+
+        // Add to tracking
+        state.trackedEvents.set(eventId, {
+            eventId,
+            title: event.title,
+            marketCount: event.markets.length,
+            estimatedEndMin: event.end_date,
+            estimatedEndMax: null,
+            lastChecked: 0,
+            checkCount: 0,
+            postEndCheckCount: 0,
+            nextCheckAt: calculateNextCheck(event.end_date, 0),
+        });
+        newEvents.push(event);
+    }
+
+    if (newEvents.length === 0) return;
+
+    log.info(`Discovery: ${newEvents.length} new events entering 24h horizon (${state.trackedEvents.size} total tracked)`);
+
+    // Immediately check newly discovered events with Perplexity
+    // Sort soonest-ending first
+    newEvents.sort((a, b) => {
+        const aEnd = new Date(a.end_date).getTime();
+        const bEnd = new Date(b.end_date).getTime();
+        return aEnd - bEnd;
+    });
+
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
+    const reserveSlotForWS = concurrency >= 2;
+    const workerStart = reserveSlotForWS ? 1 : 0;
+    const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
+
+    if (workerCount <= 0) {
+        log.warn('Discovery: no bridge slots available (all reserved for WS)');
+        return;
+    }
+
+    const queue = newEvents.map(event => ({
+        event,
+        tracked: state.trackedEvents.get(event.polymarket_event_id),
+    }));
+
+    const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
+
+    async function worker(slotIndex) {
+        while (queue.length > 0) {
+            const item = queue.shift();
+            if (!item) break;
+            try {
+                await processEvent(item.event, item.tracked, slotIndex, state, counters);
+            } catch (e) {
+                log.error(`Discovery#${slotIndex} error: ${e.message}`);
+            }
+        }
+    }
+
+    await Promise.all(
+        Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
+    );
+
+    if (counters.resolved > 0 || counters.rechecked > 0) {
+        log.info(`Discovery: ${counters.rechecked} checked, ${counters.resolved} resolved immediately`);
+    }
+}
+
 // ─── Event processing ───
 
-async function processEvent(event, tracked, slotIndex, state, counters) {
+async function processEvent(event, tracked, slotIndex, state, counters, { skipGammaPreflight = false } = {}) {
     const eventId = event.polymarket_event_id;
 
     // Pre-flight: skip if already closed on Polymarket (saves expensive Perplexity query)
-    const firstMarket = event.markets?.[0];
-    if (firstMarket?.polymarket_market_id) {
-        try {
-            const gmRes = await fetch(`${config.GAMMA_BASE}/markets/${firstMarket.polymarket_market_id}`);
-            if (gmRes.ok) {
-                const live = await gmRes.json();
-                if (live.closed) {
-                    log.info(`SKIP (closed on PM): "${event.title.slice(0, 60)}"`);
-                    state.resolvedEventIds.set(eventId, Date.now());
+    // Skipped when agent cycle already batch-checked Gamma upfront
+    if (!skipGammaPreflight) {
+        const firstMarket = event.markets?.[0];
+        if (firstMarket?.polymarket_market_id) {
+            try {
+                const gmRes = await fetch(`${config.GAMMA_BASE}/markets/${firstMarket.polymarket_market_id}`);
+                if (gmRes.ok) {
+                    const live = await gmRes.json();
+                    if (live.closed) {
+                        log.info(`SKIP (closed on PM): "${event.title.slice(0, 60)}"`);
+                        state.resolvedEventIds.set(eventId, Date.now());
+                        return;
+                    }
+                } else {
+                    log.warn(`Gamma API ${gmRes.status} for "${event.title.slice(0, 60)}", skipping to be safe`);
                     return;
                 }
-            } else {
-                log.warn(`Gamma API ${gmRes.status} for "${event.title.slice(0, 60)}", skipping to be safe`);
+            } catch (e) {
+                log.warn(`Gamma pre-flight failed for "${event.title.slice(0, 60)}": ${e.message}, skipping`);
                 return;
             }
-        } catch (e) {
-            log.warn(`Gamma pre-flight failed for "${event.title.slice(0, 60)}": ${e.message}, skipping`);
-            return;
         }
     }
 
@@ -692,6 +843,7 @@ function parseTokenIds(market) {
 
 async function fetchPrices(market) {
     try {
+        let bookResult = null;
         const tokenIds = parseTokenIds(market);
 
         if (tokenIds) {
@@ -702,7 +854,19 @@ async function fetchPrices(market) {
             const yesBid = yesBook.bids?.[0]?.price;
             const yesAsk = yesBook.asks?.[0]?.price;
             if (yesBid || yesAsk) {
-                return {
+                const bid = parseFloat(yesBid) || 0;
+                const ask = parseFloat(yesAsk) || 1;
+                const spread = ask - bid;
+                // Only trust book if spread is tight (< 20¢); wide spread = thin book
+                if (spread < 0.20) {
+                    return {
+                        type: 'book',
+                        yesBid: yesBid || '—', yesAsk: yesAsk || '—',
+                        noBid: noBook.bids?.[0]?.price || '—', noAsk: noBook.asks?.[0]?.price || '—',
+                    };
+                }
+                // Save book data in case Gamma also fails
+                bookResult = {
                     type: 'book',
                     yesBid: yesBid || '—', yesAsk: yesAsk || '—',
                     noBid: noBook.bids?.[0]?.price || '—', noAsk: noBook.asks?.[0]?.price || '—',
@@ -710,6 +874,7 @@ async function fetchPrices(market) {
             }
         }
 
+        // Gamma API gives mid-market price (what the UI shows)
         if (market.polymarket_market_id) {
             const res = await fetch(`${config.GAMMA_BASE}/markets/${market.polymarket_market_id}`);
             if (res.ok) {
@@ -720,6 +885,9 @@ async function fetchPrices(market) {
                 }
             }
         }
+
+        // Fall back to wide book if we have it
+        if (bookResult) return bookResult;
 
         const stored = typeof market.outcome_prices === 'string'
             ? JSON.parse(market.outcome_prices) : market.outcome_prices;
@@ -760,19 +928,8 @@ function shortQuestion(q, eventTitle) {
 async function sendTelegramAlert(event, market, result, prices, profitPct) {
     if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) return;
 
-    // Final guard: verify market is still open on Polymarket
-    if (market.polymarket_market_id) {
-        try {
-            const gmRes = await fetch(`${config.GAMMA_BASE}/markets/${market.polymarket_market_id}`);
-            if (gmRes.ok) {
-                const live = await gmRes.json();
-                if (live.closed) {
-                    log.info(`ALERT BLOCKED (closed on PM): "${event.title.slice(0, 60)}"`);
-                    return;
-                }
-            }
-        } catch {} // non-blocking — pre-flight already handled strict check
-    }
+    // Gamma pre-flight already verified market is open in processEvent (5-30s ago).
+    // Redundant check removed for speed.
 
     const eventUrl = `https://polymarket.com/event/${event.slug || ''}`;
     const marketUrl = `https://polymarket.com/event/${event.slug || ''}/${market.slug || ''}`;

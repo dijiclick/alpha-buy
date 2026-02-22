@@ -4,6 +4,9 @@ import { spawn, spawnSync } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { recheckOpportunityLive } from './live_recheck.mjs';
+import { loadAlertState, saveAlertState, isDuplicateWithinWindow, markSent } from './alert_state.mjs';
+import { sendEdgeTelegramAlert } from './telegram.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -11,6 +14,7 @@ const __dirname = dirname(__filename);
 const CACHE_DIR = join(__dirname, 'cache');
 const REPORT_DIR = join(__dirname, 'reports');
 const CACHE_FILE = join(CACHE_DIR, 'relation_cache.json');
+const ALERT_STATE_FILE = join(CACHE_DIR, 'alert_state.json');
 
 function env(name) {
   const v = process.env[name];
@@ -21,6 +25,15 @@ function env(name) {
 function numEnv(name, fallback) {
   const v = Number(process.env[name]);
   return Number.isFinite(v) ? v : fallback;
+}
+
+function boolEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw === '') return fallback;
+  const v = String(raw).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(v)) return true;
+  if (['0', 'false', 'no', 'off'].includes(v)) return false;
+  return fallback;
 }
 
 function commandExists(cmd) {
@@ -72,6 +85,15 @@ const cfg = {
   MAX_BRIDGE_WORKERS: numEnv('EDGE_MAX_BRIDGE_WORKERS', 3),
   PAIR_QUERY_RETRIES: Math.max(0, Math.floor(numEnv('EDGE_PAIR_QUERY_RETRIES', 2))),
   PAIR_RETRY_BACKOFF_MS: Math.max(250, Math.floor(numEnv('EDGE_PAIR_RETRY_BACKOFF_MS', 1500))),
+  EDGE_TELEGRAM_ENABLED: boolEnv('EDGE_TELEGRAM_ENABLED', true),
+  EDGE_ALERT_MIN_NET_EDGE: numEnv('EDGE_ALERT_MIN_NET_EDGE', 0.03),
+  EDGE_ALERT_MIN_CONFIDENCE: numEnv('EDGE_ALERT_MIN_CONFIDENCE', 85),
+  EDGE_ALERT_DEDUPE_HOURS: numEnv('EDGE_ALERT_DEDUPE_HOURS', 6),
+  EDGE_ALERT_TOP_N: Math.max(1, Math.floor(numEnv('EDGE_ALERT_TOP_N', 5))),
+  EDGE_LIVE_RECHECK_TIMEOUT_MS: Math.max(500, Math.floor(numEnv('EDGE_LIVE_RECHECK_TIMEOUT_MS', 8000))),
+  EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT: numEnv('EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT', 0.05),
+  EDGE_CLOB_BASE: process.env.EDGE_CLOB_BASE || 'https://clob.polymarket.com',
+  GAMMA_BASE: process.env.GAMMA_BASE || 'https://gamma-api.polymarket.com',
 };
 
 const STOPWORDS = new Set([
@@ -693,9 +715,63 @@ function toMarkdown(summary, opportunities) {
   return lines.join('\n');
 }
 
+function topReasonArray(reasonMap, max = 6) {
+  return [...reasonMap.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, max)
+    .map(([reason, count]) => ({ reason, count }));
+}
+
+function publicSummaryConfig(config) {
+  return {
+    PYTHON_CMD: config.PYTHON_CMD,
+    BRIDGE_PATH: config.BRIDGE_PATH,
+    GAMMA_BASE: config.GAMMA_BASE,
+    EDGE_CLOB_BASE: config.EDGE_CLOB_BASE,
+    HORIZON_HOURS: config.HORIZON_HOURS,
+    MAX_EVENTS: config.MAX_EVENTS,
+    MAX_MARKETS_PER_EVENT: config.MAX_MARKETS_PER_EVENT,
+    MAX_PAIRS_PER_EVENT: config.MAX_PAIRS_PER_EVENT,
+    MAX_PAIR_CHECKS: config.MAX_PAIR_CHECKS,
+    MIN_SHARED_TOKENS: config.MIN_SHARED_TOKENS,
+    MIN_YES_PRICE: config.MIN_YES_PRICE,
+    MAX_YES_PRICE: config.MAX_YES_PRICE,
+    PREFILTER_SUM_EXCESS: config.PREFILTER_SUM_EXCESS,
+    PREFILTER_DIFF: config.PREFILTER_DIFF,
+    PREFILTER_HIGH_PRICE: config.PREFILTER_HIGH_PRICE,
+    RELATION_MIN_CONFIDENCE: config.RELATION_MIN_CONFIDENCE,
+    IMPOSSIBLE_MIN_CONFIDENCE: config.IMPOSSIBLE_MIN_CONFIDENCE,
+    FEE_BUFFER_TWO_LEG: config.FEE_BUFFER_TWO_LEG,
+    FEE_BUFFER_SINGLE_LEG: config.FEE_BUFFER_SINGLE_LEG,
+    MIN_NET_EDGE: config.MIN_NET_EDGE,
+    CACHE_TTL_HOURS: config.CACHE_TTL_HOURS,
+    REPORT_TOP_N: config.REPORT_TOP_N,
+    MAX_BRIDGE_WORKERS: config.MAX_BRIDGE_WORKERS,
+    PAIR_QUERY_RETRIES: config.PAIR_QUERY_RETRIES,
+    PAIR_RETRY_BACKOFF_MS: config.PAIR_RETRY_BACKOFF_MS,
+    EDGE_TELEGRAM_ENABLED: config.EDGE_TELEGRAM_ENABLED,
+    EDGE_ALERT_MIN_NET_EDGE: config.EDGE_ALERT_MIN_NET_EDGE,
+    EDGE_ALERT_MIN_CONFIDENCE: config.EDGE_ALERT_MIN_CONFIDENCE,
+    EDGE_ALERT_DEDUPE_HOURS: config.EDGE_ALERT_DEDUPE_HOURS,
+    EDGE_ALERT_TOP_N: config.EDGE_ALERT_TOP_N,
+    EDGE_LIVE_RECHECK_TIMEOUT_MS: config.EDGE_LIVE_RECHECK_TIMEOUT_MS,
+    EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT: config.EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT,
+  };
+}
+
 async function main() {
   console.log('[edge] starting standalone logic-edge scanner');
   console.log(`[edge] python_cmd=${cfg.PYTHON_CMD}`);
+  const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN || '';
+  const telegramChatId = process.env.TELEGRAM_CHAT_ID || '';
+  const telegramConfigured = !!telegramBotToken && !!telegramChatId;
+  const telegramReady = cfg.EDGE_TELEGRAM_ENABLED && telegramConfigured;
+  if (cfg.EDGE_TELEGRAM_ENABLED && !telegramConfigured) {
+    console.warn('[edge] WARN: Telegram enabled but TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing; alerts disabled for this run');
+  } else if (!cfg.EDGE_TELEGRAM_ENABLED) {
+    console.log('[edge] Telegram alerts disabled by EDGE_TELEGRAM_ENABLED=false');
+  }
+
   const db = createClient(cfg.SUPABASE_URL, cfg.SUPABASE_KEY);
 
   const events = await fetchEvents(db);
@@ -710,17 +786,31 @@ async function main() {
   let failedPairs = 0;
   const failReasons = new Map();
   let uncachedPairs = 0;
+  let alertsAttempted = 0;
+  let alertsSent = 0;
+  let alertsSkippedDedupe = 0;
+  let alertsSkippedRecheck = 0;
+  let alertsFailedSend = 0;
+  const alertSkipReasons = new Map();
 
   const queue = [...candidates];
   if (queue.length === 0) {
     const summary = {
       generated_at: new Date().toISOString(),
-      config: cfg,
+      config: publicSummaryConfig(cfg),
       events_scanned: events.length,
       candidates: 0,
       analyzed_pairs: 0,
       cache_hits: 0,
       failed_pairs: 0,
+      alerts_enabled: cfg.EDGE_TELEGRAM_ENABLED,
+      alerts_ready: telegramReady,
+      alerts_attempted: 0,
+      alerts_sent: 0,
+      alerts_skipped_dedupe: 0,
+      alerts_skipped_recheck: 0,
+      alerts_failed_send: 0,
+      alert_skip_reasons_top: [],
       opportunities_found: 0,
     };
     ensureDirs();
@@ -801,9 +891,68 @@ async function main() {
     return b.confidence - a.confidence;
   });
 
+  if (telegramReady) {
+    const alertState = loadAlertState(ALERT_STATE_FILE, Math.max(cfg.EDGE_ALERT_DEDUPE_HOURS * 4, 24 * 7));
+    const alertCandidates = opportunities
+      .filter(op => Number(op.net_edge) >= cfg.EDGE_ALERT_MIN_NET_EDGE)
+      .filter(op => Number(op.confidence) >= cfg.EDGE_ALERT_MIN_CONFIDENCE)
+      .slice(0, cfg.EDGE_ALERT_TOP_N);
+
+    for (const op of alertCandidates) {
+      const dedupeKey = `${op.event_id}|${op.market_a_id}|${op.market_b_id}|${op.type}`;
+
+      if (isDuplicateWithinWindow(alertState, dedupeKey, cfg.EDGE_ALERT_DEDUPE_HOURS)) {
+        alertsSkippedDedupe++;
+        alertSkipReasons.set('duplicate_within_window', (alertSkipReasons.get('duplicate_within_window') || 0) + 1);
+        continue;
+      }
+
+      const recheck = await recheckOpportunityLive(op, {
+        gammaBase: cfg.GAMMA_BASE,
+        clobBase: cfg.EDGE_CLOB_BASE,
+        timeoutMs: cfg.EDGE_LIVE_RECHECK_TIMEOUT_MS,
+        maxPriceDrift: cfg.EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT,
+        feeBufferTwoLeg: cfg.FEE_BUFFER_TWO_LEG,
+        feeBufferSingleLeg: cfg.FEE_BUFFER_SINGLE_LEG,
+        minNetEdge: cfg.EDGE_ALERT_MIN_NET_EDGE,
+      });
+
+      if (!recheck.eligible || !recheck.liveOpportunity) {
+        alertsSkippedRecheck++;
+        const rsn = recheck.reason || 'live_recheck_failed';
+        alertSkipReasons.set(rsn, (alertSkipReasons.get(rsn) || 0) + 1);
+        continue;
+      }
+
+      alertsAttempted++;
+      const send = await sendEdgeTelegramAlert(recheck.liveOpportunity, {
+        botToken: telegramBotToken,
+        chatId: telegramChatId,
+      });
+      if (send.ok) {
+        alertsSent++;
+        markSent(alertState, dedupeKey, {
+          last_net_edge: recheck.liveOpportunity.net_edge,
+          last_confidence: recheck.liveOpportunity.confidence,
+        });
+      } else {
+        alertsFailedSend++;
+        const rsn = send.error || `telegram_status_${send.status || 0}`;
+        alertSkipReasons.set(rsn, (alertSkipReasons.get(rsn) || 0) + 1);
+      }
+    }
+
+    saveAlertState(ALERT_STATE_FILE, alertState, Math.max(cfg.EDGE_ALERT_DEDUPE_HOURS * 4, 24 * 7));
+  }
+  else if (cfg.EDGE_TELEGRAM_ENABLED && !telegramConfigured) {
+    alertSkipReasons.set('telegram_not_configured', 1);
+  }
+
+  const alertSkipTop = topReasonArray(alertSkipReasons);
+
   const summary = {
     generated_at: new Date().toISOString(),
-    config: cfg,
+    config: publicSummaryConfig(cfg),
     events_scanned: events.length,
     candidates: candidates.length,
     analyzed_pairs: analyzedPairs,
@@ -812,6 +961,14 @@ async function main() {
     failed_pairs: failedPairs,
     failed_uncached_pairs: failedPairs,
     fail_reasons_top: failTop,
+    alerts_enabled: cfg.EDGE_TELEGRAM_ENABLED,
+    alerts_ready: telegramReady,
+    alerts_attempted: alertsAttempted,
+    alerts_sent: alertsSent,
+    alerts_skipped_dedupe: alertsSkippedDedupe,
+    alerts_skipped_recheck: alertsSkippedRecheck,
+    alerts_failed_send: alertsFailedSend,
+    alert_skip_reasons_top: alertSkipTop,
     opportunities_found: opportunities.length,
   };
 
@@ -831,6 +988,15 @@ async function main() {
 
   console.log(`[edge] analyzed=${analyzedPairs} cache_hits=${cacheHits} failed=${failedPairs}`);
   console.log(`[edge] opportunities=${opportunities.length}`);
+  console.log(
+    `[edge] alerts attempted=${alertsAttempted} sent=${alertsSent} ` +
+    `skip_dedupe=${alertsSkippedDedupe} skip_recheck=${alertsSkippedRecheck} failed_send=${alertsFailedSend}`
+  );
+  if (alertSkipTop.length > 0) {
+    for (const s of alertSkipTop) {
+      console.log(`[edge] alert_skip x${s.count}: ${s.reason}`);
+    }
+  }
   if (opportunities[0]) {
     console.log(`[edge] top: ${(opportunities[0].net_edge * 100).toFixed(2)}% ${opportunities[0].strategy} | ${opportunities[0].event_title}`);
   }
