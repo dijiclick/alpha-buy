@@ -4,7 +4,6 @@ import { spawn, spawnSync } from 'child_process';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
-import { recheckOpportunityLive } from './live_recheck.mjs';
 import { loadAlertState, saveAlertState, isDuplicateWithinWindow, markSent } from './alert_state.mjs';
 import { sendEdgeTelegramAlert } from './telegram.mjs';
 
@@ -13,8 +12,10 @@ const __dirname = dirname(__filename);
 
 const CACHE_DIR = join(__dirname, 'cache');
 const REPORT_DIR = join(__dirname, 'reports');
-const CACHE_FILE = join(CACHE_DIR, 'relation_cache.json');
+const CACHE_FILE = join(CACHE_DIR, 'prediction_cache.json');
 const ALERT_STATE_FILE = join(CACHE_DIR, 'alert_state.json');
+
+// ─── Env helpers ───
 
 function env(name) {
   const v = process.env[name];
@@ -59,61 +60,60 @@ function resolvePythonCmd(preferred) {
   throw new Error(`Python runner not found: ${preferred || 'python'}`);
 }
 
+// ─── Config ───
+
 const cfg = {
   SUPABASE_URL: env('SUPABASE_URL'),
   SUPABASE_KEY: env('SUPABASE_SERVICE_KEY'),
   PYTHON_CMD: resolvePythonCmd(process.env.PYTHON_CMD || 'uv'),
   BRIDGE_PATH: process.env.CONSTRAINT_BRIDGE_PATH || join(__dirname, 'constraint_bridge.py'),
-  HORIZON_HOURS: numEnv('EDGE_HORIZON_HOURS', 72),
-  MAX_EVENTS: numEnv('EDGE_MAX_EVENTS', 600),
-  MAX_MARKETS_PER_EVENT: numEnv('EDGE_MAX_MARKETS_PER_EVENT', 14),
-  MAX_PAIRS_PER_EVENT: numEnv('EDGE_MAX_PAIRS_PER_EVENT', 28),
-  MAX_PAIR_CHECKS: numEnv('EDGE_MAX_PAIR_CHECKS', 120),
-  MIN_SHARED_TOKENS: numEnv('EDGE_MIN_SHARED_TOKENS', 2),
-  MIN_YES_PRICE: numEnv('EDGE_MIN_YES_PRICE', 0.08),
-  MAX_YES_PRICE: numEnv('EDGE_MAX_YES_PRICE', 0.95),
-  PREFILTER_SUM_EXCESS: numEnv('EDGE_PREFILTER_SUM_EXCESS', 0.03),
-  PREFILTER_DIFF: numEnv('EDGE_PREFILTER_DIFF', 0.08),
-  PREFILTER_HIGH_PRICE: numEnv('EDGE_PREFILTER_HIGH_PRICE', 0.8),
-  RELATION_MIN_CONFIDENCE: numEnv('EDGE_RELATION_MIN_CONFIDENCE', 78),
-  IMPOSSIBLE_MIN_CONFIDENCE: numEnv('EDGE_IMPOSSIBLE_MIN_CONFIDENCE', 88),
-  FEE_BUFFER_TWO_LEG: numEnv('EDGE_FEE_BUFFER_TWO_LEG', 0.03),
-  FEE_BUFFER_SINGLE_LEG: numEnv('EDGE_FEE_BUFFER_SINGLE_LEG', 0.015),
-  MIN_NET_EDGE: numEnv('EDGE_MIN_NET_EDGE', 0.02),
-  CACHE_TTL_HOURS: numEnv('EDGE_CACHE_TTL_HOURS', 6),
+  GAMMA_BASE: process.env.GAMMA_BASE || 'https://gamma-api.polymarket.com',
+  CLOB_BASE: process.env.EDGE_CLOB_BASE || 'https://clob.polymarket.com',
+  HORIZON_HOURS: numEnv('EDGE_HORIZON_HOURS', 24),
+  HORIZON_BUFFER_MINS: numEnv('EDGE_HORIZON_BUFFER_MINS', 10),
+  MAX_EVENTS: numEnv('EDGE_MAX_EVENTS', 200),
+  MAX_MARKETS_PER_EVENT: numEnv('EDGE_MAX_MARKETS_PER_EVENT', 15),
+  MIN_PROBABILITY: numEnv('EDGE_MIN_PROBABILITY', 80),
+  MAX_BUY_PRICE: numEnv('EDGE_MAX_BUY_PRICE', 0.95),
+  MIN_PROFIT_PCT: numEnv('EDGE_MIN_PROFIT_PCT', 5),
+  CACHE_TTL_HOURS: numEnv('EDGE_CACHE_TTL_HOURS', 2),
   REPORT_TOP_N: numEnv('EDGE_REPORT_TOP_N', 40),
   MAX_BRIDGE_WORKERS: numEnv('EDGE_MAX_BRIDGE_WORKERS', 3),
-  PAIR_QUERY_RETRIES: Math.max(0, Math.floor(numEnv('EDGE_PAIR_QUERY_RETRIES', 2))),
-  PAIR_RETRY_BACKOFF_MS: Math.max(250, Math.floor(numEnv('EDGE_PAIR_RETRY_BACKOFF_MS', 1500))),
-  EDGE_TELEGRAM_ENABLED: boolEnv('EDGE_TELEGRAM_ENABLED', true),
-  EDGE_ALERT_MIN_NET_EDGE: numEnv('EDGE_ALERT_MIN_NET_EDGE', 0.03),
-  EDGE_ALERT_MIN_CONFIDENCE: numEnv('EDGE_ALERT_MIN_CONFIDENCE', 85),
-  EDGE_ALERT_DEDUPE_HOURS: numEnv('EDGE_ALERT_DEDUPE_HOURS', 6),
-  EDGE_ALERT_TOP_N: Math.max(1, Math.floor(numEnv('EDGE_ALERT_TOP_N', 5))),
-  EDGE_LIVE_RECHECK_TIMEOUT_MS: Math.max(500, Math.floor(numEnv('EDGE_LIVE_RECHECK_TIMEOUT_MS', 8000))),
-  EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT: numEnv('EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT', 0.05),
-  EDGE_CLOB_BASE: process.env.EDGE_CLOB_BASE || 'https://clob.polymarket.com',
-  GAMMA_BASE: process.env.GAMMA_BASE || 'https://gamma-api.polymarket.com',
+  QUERY_RETRIES: Math.max(0, Math.floor(numEnv('EDGE_QUERY_RETRIES', 2))),
+  RETRY_BACKOFF_MS: Math.max(250, Math.floor(numEnv('EDGE_RETRY_BACKOFF_MS', 1500))),
+  TELEGRAM_ENABLED: boolEnv('EDGE_TELEGRAM_ENABLED', true),
+  ALERT_DEDUPE_HOURS: numEnv('EDGE_ALERT_DEDUPE_HOURS', 4),
+  ALERT_TOP_N: Math.max(1, Math.floor(numEnv('EDGE_ALERT_TOP_N', 10))),
 };
 
-const STOPWORDS = new Set([
-  'the', 'a', 'an', 'to', 'of', 'and', 'or', 'in', 'on', 'for', 'at', 'by',
-  'will', 'be', 'is', 'are', 'was', 'were', 'do', 'does', 'did', 'with',
-  'from', 'than', 'that', 'this', 'these', 'those', 'as', 'it', 'its', 'their',
-  'after', 'before', 'over', 'under', 'into', 'vs', 'if', 'any', 'all',
-]);
+// ─── Blocked categories ───
 
-function getPerplexityTokens() {
-  const out = [];
-  const first = process.env.PERPLEXITY_SESSION_TOKEN;
-  if (!first) throw new Error('Missing env: PERPLEXITY_SESSION_TOKEN');
-  out.push(first);
-  for (let i = 2; i <= 10; i++) {
-    const t = process.env[`PERPLEXITY_SESSION_TOKEN_${i}`];
-    if (t) out.push(t);
+const BLOCKED_TITLE_PATTERNS = [
+  // Soccer
+  /\bsoccer\b/i, /\bfootball\b(?!.*american)/i, /\bUEFA\b/i, /\bFIFA\b/i,
+  /\bPremier League\b/i, /\bLa Liga\b/i, /\bSerie A\b/i, /\bBundesliga\b/i,
+  /\bChampions League\b/i, /\bMLS\b/i, /\bEuro\s*\d/i, /\bLigue 1\b/i,
+  /\bEredivisie\b/i, /\bEPL\b/i,
+  // Basketball
+  /\bbasketball\b/i, /\bNBA\b/, /\bWNBA\b/, /\bNCAA basketball\b/i,
+  /\bMarch Madness\b/i, /\bNCAA\b.*\b(men|women).*basketball/i,
+  // Baseball
+  /\bbaseball\b/i, /\bMLB\b/, /\bWorld Series\b/i,
+  // Crypto
+  /\bbitcoin\b/i, /\bethereum\b/i, /\bBTC\b/, /\bETH\b/,
+  /\bcrypto\b/i, /\btoken price\b/i, /\bsolana\b/i, /\bSOL\b/,
+  /\bdogecoin\b/i, /\bDOGE\b/, /\bcardano\b/i, /\bADA\b/,
+  /\bXRP\b/, /\bripple\b/i,
+];
+
+function isBlockedEvent(title) {
+  for (const pat of BLOCKED_TITLE_PATTERNS) {
+    if (pat.test(title)) return true;
   }
-  return out;
+  return false;
 }
+
+// ─── Utilities ───
 
 function toNum(v) {
   const n = Number(v);
@@ -124,40 +124,7 @@ function parseJsonMaybe(v, fallback) {
   if (v == null) return fallback;
   if (Array.isArray(v) || typeof v === 'object') return v;
   if (typeof v !== 'string') return fallback;
-  try {
-    return JSON.parse(v);
-  } catch {
-    return fallback;
-  }
-}
-
-function norm(s) {
-  return String(s || '').toLowerCase();
-}
-
-function tokenize(text) {
-  return norm(text)
-    .replace(/[^a-z0-9\s]/g, ' ')
-    .split(/\s+/)
-    .map(x => x.trim())
-    .filter(x => x.length >= 2 && !STOPWORDS.has(x));
-}
-
-function sharedTokenCount(a, b) {
-  const ta = new Set(tokenize(a));
-  const tb = new Set(tokenize(b));
-  let c = 0;
-  for (const t of ta) if (tb.has(t)) c++;
-  return c;
-}
-
-function looksLikeNegationPair(a, b) {
-  const sa = norm(a);
-  const sb = norm(b);
-  const hasNegA = /\bnot\b|\bno\b|\bnever\b|\bwithout\b/.test(sa);
-  const hasNegB = /\bnot\b|\bno\b|\bnever\b|\bwithout\b/.test(sb);
-  if (hasNegA === hasNegB) return false;
-  return sharedTokenCount(a, b) >= 3;
+  try { return JSON.parse(v); } catch { return fallback; }
 }
 
 function yesPrice(market) {
@@ -182,34 +149,6 @@ function yesPrice(market) {
   return p;
 }
 
-function isBinaryYesNo(market) {
-  const outcomes = parseJsonMaybe(market.outcomes, null);
-  if (!Array.isArray(outcomes) || outcomes.length !== 2) return false;
-  const set = new Set(outcomes.map(x => String(x).toLowerCase()));
-  return set.has('yes') && set.has('no');
-}
-
-function shouldCheckPair(a, b) {
-  const shared = sharedTokenCount(a.question, b.question);
-  const sum = a.yesPrice + b.yesPrice;
-  const diff = Math.abs(a.yesPrice - b.yesPrice);
-  const negationClue = looksLikeNegationPair(a.question, b.question);
-
-  if (negationClue) return true;
-  if (shared < cfg.MIN_SHARED_TOKENS) return false;
-  if (sum >= 1 + cfg.PREFILTER_SUM_EXCESS) return true;
-  if (diff >= cfg.PREFILTER_DIFF) return true;
-  if (a.yesPrice >= cfg.PREFILTER_HIGH_PRICE || b.yesPrice >= cfg.PREFILTER_HIGH_PRICE) return true;
-  return false;
-}
-
-function pairPriority(a, b) {
-  const sumExcess = Math.max(0, a.yesPrice + b.yesPrice - 1);
-  const diff = Math.abs(a.yesPrice - b.yesPrice);
-  const shared = sharedTokenCount(a.question, b.question);
-  return (sumExcess * 100) + (diff * 30) + (shared * 2);
-}
-
 function marketUrl(eventSlug, marketSlug) {
   if (marketSlug) return `https://polymarket.com/event/${eventSlug || ''}/${marketSlug}`.replace(/\/+$/, '');
   if (eventSlug) return `https://polymarket.com/event/${eventSlug}`;
@@ -225,14 +164,12 @@ function ensureDirs() {
   if (!existsSync(REPORT_DIR)) mkdirSync(REPORT_DIR, { recursive: true });
 }
 
+// ─── Cache ───
+
 function loadCache() {
   ensureDirs();
   if (!existsSync(CACHE_FILE)) return {};
-  try {
-    return JSON.parse(readFileSync(CACHE_FILE, 'utf-8'));
-  } catch {
-    return {};
-  }
+  try { return JSON.parse(readFileSync(CACHE_FILE, 'utf-8')); } catch { return {}; }
 }
 
 function saveCache(cache) {
@@ -240,14 +177,8 @@ function saveCache(cache) {
   writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
 }
 
-function cacheKey(c) {
-  return [
-    c.event.polymarket_event_id,
-    c.a.polymarket_market_id,
-    c.b.polymarket_market_id,
-    c.a.updated_at || '',
-    c.b.updated_at || '',
-  ].join('|');
+function predictionCacheKey(event) {
+  return `${event.polymarket_event_id}|${event.end_date || ''}`;
 }
 
 function isCacheFresh(entry) {
@@ -256,6 +187,22 @@ function isCacheFresh(entry) {
   if (!Number.isFinite(ts)) return false;
   return Date.now() - ts < cfg.CACHE_TTL_HOURS * 3600_000;
 }
+
+// ─── Perplexity tokens ───
+
+function getPerplexityTokens() {
+  const out = [];
+  const first = process.env.PERPLEXITY_SESSION_TOKEN;
+  if (!first) throw new Error('Missing env: PERPLEXITY_SESSION_TOKEN');
+  out.push(first);
+  for (let i = 2; i <= 10; i++) {
+    const t = process.env[`PERPLEXITY_SESSION_TOKEN_${i}`];
+    if (t) out.push(t);
+  }
+  return out;
+}
+
+// ─── Bridge ───
 
 class Bridge {
   constructor(token, index) {
@@ -401,21 +348,23 @@ async function queryWithRetries(pool, payload) {
     } catch (e) {
       attempt++;
       const msg = normalizeErrorMessage(e?.message || e);
-      if (attempt > cfg.PAIR_QUERY_RETRIES || !isRetryableError(msg)) {
+      if (attempt > cfg.QUERY_RETRIES || !isRetryableError(msg)) {
         throw new Error(msg);
       }
-      const wait = cfg.PAIR_RETRY_BACKOFF_MS * attempt;
+      const wait = cfg.RETRY_BACKOFF_MS * attempt;
       await sleep(wait);
     }
   }
 }
+
+// ─── Fetch events from Supabase ───
 
 async function fetchEvents(db) {
   const out = [];
   let from = 0;
   const pageSize = 300;
   const now = Date.now();
-  const horizonMs = cfg.HORIZON_HOURS * 3600_000;
+  const horizonMs = (cfg.HORIZON_HOURS * 60 + cfg.HORIZON_BUFFER_MINS) * 60_000;
 
   while (out.length < cfg.MAX_EVENTS) {
     const { data: eventRows, error: evErr } = await db
@@ -430,8 +379,15 @@ async function fetchEvents(db) {
 
     const eligibleEvents = [];
     for (const ev of eventRows) {
+      // Must have an end_date
       const endTs = ev.end_date ? new Date(ev.end_date).getTime() : NaN;
-      if (Number.isFinite(endTs) && endTs - now > horizonMs) continue;
+      if (!Number.isFinite(endTs)) continue;
+      // Must end within horizon
+      if (endTs - now > horizonMs) continue;
+      // Must not have already ended more than 1 hour ago (allow buffer for late resolution)
+      if (endTs < now - 3600_000) continue;
+      // Not blocked category
+      if (isBlockedEvent(ev.title || '')) continue;
       eligibleEvents.push(ev);
     }
 
@@ -443,7 +399,7 @@ async function fetchEvents(db) {
         const batch = ids.slice(i, i + 100);
         const { data: marketRows, error: mkErr } = await db
           .from('markets')
-          .select('event_id,polymarket_market_id,question,description,slug,outcomes,outcome_prices,best_ask,last_trade_price,active,closed,end_date,updated_at')
+          .select('event_id,polymarket_market_id,question,description,slug,outcomes,outcome_prices,best_ask,last_trade_price,clob_token_ids,active,closed,end_date,updated_at')
           .in('event_id', batch)
           .eq('active', true)
           .eq('closed', false);
@@ -456,14 +412,11 @@ async function fetchEvents(db) {
 
       for (const ev of eligibleEvents) {
         const markets = (marketsByEvent.get(ev.id) || [])
-          .filter(isBinaryYesNo)
           .map(m => ({ ...m, yesPrice: yesPrice(m) }))
           .filter(m => m.yesPrice != null)
-          .filter(m => m.yesPrice >= cfg.MIN_YES_PRICE && m.yesPrice <= cfg.MAX_YES_PRICE)
-          .sort((a, b) => b.yesPrice - a.yesPrice)
           .slice(0, cfg.MAX_MARKETS_PER_EVENT);
 
-        if (markets.length < 2) continue;
+        if (markets.length === 0) continue;
         out.push({
           polymarket_event_id: ev.polymarket_event_id,
           title: ev.title,
@@ -483,207 +436,337 @@ async function fetchEvents(db) {
   return out;
 }
 
-function buildCandidates(events) {
-  const pairs = [];
-  for (const event of events) {
-    const local = [];
-    const mkts = event.markets;
-    for (let i = 0; i < mkts.length; i++) {
-      for (let j = i + 1; j < mkts.length; j++) {
-        const a = mkts[i];
-        const b = mkts[j];
-        if (!shouldCheckPair(a, b)) continue;
-        local.push({
-          event,
-          a,
-          b,
-          priority: pairPriority(a, b),
-          shared_tokens: sharedTokenCount(a.question, b.question),
-        });
-      }
-    }
-    local.sort((x, y) => y.priority - x.priority);
-    pairs.push(...local.slice(0, cfg.MAX_PAIRS_PER_EVENT));
-  }
+// ─── Gamma pre-flight ───
 
-  pairs.sort((x, y) => y.priority - x.priority);
-  return pairs.slice(0, cfg.MAX_PAIR_CHECKS);
+async function isEventClosedOnGamma(event) {
+  try {
+    const res = await fetch(`${cfg.GAMMA_BASE}/events/${event.polymarket_event_id}`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return data?.closed === true;
+  } catch {
+    return false;
+  }
 }
 
-function relationPayload(candidate) {
-  return {
-    event_title: candidate.event.title,
-    event_description: candidate.event.description || '',
-    scheduled_end: candidate.event.end_date || '',
-    market_a: {
-      id: candidate.a.polymarket_market_id,
-      question: candidate.a.question,
-      description: candidate.a.description || '',
-      yes_price: candidate.a.yesPrice,
-    },
-    market_b: {
-      id: candidate.b.polymarket_market_id,
-      question: candidate.b.question,
-      description: candidate.b.description || '',
-      yes_price: candidate.b.yesPrice,
-    },
+// ─── Live price fetching ───
+
+async function fetchLivePrices(market) {
+  // Try Gamma API first
+  try {
+    const res = await fetch(`${cfg.GAMMA_BASE}/markets/${market.polymarket_market_id}`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const yes = toNum(data?.bestAsk ?? data?.best_ask ?? data?.lastTradePrice ?? data?.last_trade_price);
+      if (yes != null && yes >= 0 && yes <= 1) {
+        return { yesPrice: yes, noPrice: Number((1 - yes).toFixed(4)), source: 'gamma', closed: data?.closed === true };
+      }
+    }
+  } catch { /* fallthrough */ }
+
+  // Fallback to stored price
+  const stored = yesPrice(market);
+  if (stored != null) {
+    return { yesPrice: stored, noPrice: Number((1 - stored).toFixed(4)), source: 'stored', closed: false };
+  }
+
+  return null;
+}
+
+// ─── Build prediction payload ───
+
+function buildPayload(event, calibrationData) {
+  const payload = {
+    event_title: event.title,
+    event_description: event.description || '',
+    end_date: event.end_date || '',
+    market_questions: event.markets.map(m => m.question),
+    market_descriptions: event.markets.map(m => m.description || ''),
   };
+  if (calibrationData) payload.calibration = calibrationData;
+  return payload;
 }
 
-function maybeAdd(opps, op) {
-  if (op.net_edge < cfg.MIN_NET_EDGE) return;
-  opps.push(op);
+// ─── DB: upsert prediction ───
+
+async function upsertEdgePrediction(db, row) {
+  const payload = { ...row, updated_at: new Date().toISOString() };
+  // Cap profit_pct to prevent NUMERIC(8,4) overflow (max 9999.9999)
+  if (payload.profit_pct != null && payload.profit_pct > 9999) payload.profit_pct = 9999;
+  const { data, error } = await db
+    .from('edge_predictions')
+    .upsert(payload, { onConflict: 'event_id,market_id' })
+    .select('id')
+    .single();
+  if (error) {
+    console.error(`[edge] upsert prediction failed for ${row.market_id}:`, error.message);
+    return null;
+  }
+  return data?.id ?? null;
 }
 
-function evaluate(candidate, rel) {
-  const opps = [];
-  const pA = candidate.a.yesPrice;
-  const pB = candidate.b.yesPrice;
-  const ev = candidate.event;
-  const base = {
-    event_id: ev.polymarket_event_id,
-    event_title: ev.title,
-    event_slug: ev.slug || '',
-    market_a_id: candidate.a.polymarket_market_id,
-    market_b_id: candidate.b.polymarket_market_id,
-    market_a_question: candidate.a.question,
-    market_b_question: candidate.b.question,
-    market_a_yes: pA,
-    market_b_yes: pB,
-    market_a_url: marketUrl(ev.slug, candidate.a.slug),
-    market_b_url: marketUrl(ev.slug, candidate.b.slug),
-    relation: rel.relation,
-    confidence: rel.confidence,
-    reason: rel.reason || '',
-    evidence: rel.evidence || [],
+// ─── Resolution checker ───
+
+const ACCURACY_STATS_FILE = join(CACHE_DIR, 'accuracy_stats.json');
+const RESOLVE_BATCH_SIZE = numEnv('EDGE_RESOLVE_BATCH_SIZE', 100);
+const RESOLVE_MIN_AGE_HOURS = numEnv('EDGE_RESOLVE_MIN_AGE_HOURS', 1);
+const CALIBRATION_MIN_SAMPLES = numEnv('EDGE_CALIBRATION_MIN_SAMPLES', 20);
+
+async function checkResolutions(db) {
+  const cutoff = new Date(Date.now() - RESOLVE_MIN_AGE_HOURS * 3600_000).toISOString();
+
+  const { data: unresolved, error } = await db
+    .from('edge_predictions')
+    .select('id, market_id, predicted_outcome, event_title')
+    .is('actual_outcome', null)
+    .lt('event_end_date', cutoff)
+    .limit(RESOLVE_BATCH_SIZE);
+
+  if (error) {
+    console.error('[edge] checkResolutions query failed:', error.message);
+    return;
+  }
+  if (!unresolved || unresolved.length === 0) {
+    console.log('[edge] no unresolved predictions to check');
+    return;
+  }
+
+  // Group by unique market_id
+  const byMarket = new Map();
+  for (const row of unresolved) {
+    if (!byMarket.has(row.market_id)) byMarket.set(row.market_id, []);
+    byMarket.get(row.market_id).push(row);
+  }
+
+  const marketIds = [...byMarket.keys()];
+  let resolved = 0, correct = 0, incorrect = 0, skipped = 0;
+
+  // Batch Gamma API calls
+  for (let i = 0; i < marketIds.length; i += 20) {
+    const batch = marketIds.slice(i, i + 20);
+    const results = await Promise.allSettled(
+      batch.map(async (mid) => {
+        const res = await fetch(`${cfg.GAMMA_BASE}/markets/${mid}`, {
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!res.ok) return null;
+        return res.json();
+      })
+    );
+
+    for (let j = 0; j < batch.length; j++) {
+      const mid = batch[j];
+      const result = results[j];
+      if (result.status !== 'fulfilled' || !result.value) {
+        skipped += byMarket.get(mid).length;
+        continue;
+      }
+
+      const gammaMarket = result.value;
+      if (gammaMarket.closed !== true) {
+        skipped += byMarket.get(mid).length;
+        continue;
+      }
+
+      // Determine actual outcome from final prices
+      const outcomes = parseJsonMaybe(gammaMarket.outcomes, ['Yes', 'No']);
+      const prices = parseJsonMaybe(gammaMarket.outcomePrices, null);
+      if (!Array.isArray(prices) || prices.length === 0) {
+        skipped += byMarket.get(mid).length;
+        continue;
+      }
+
+      let yesIdx = 0;
+      if (Array.isArray(outcomes)) {
+        const idx = outcomes.findIndex(x => String(x).toLowerCase() === 'yes');
+        if (idx >= 0) yesIdx = idx;
+      }
+
+      const finalYes = parseFloat(prices[yesIdx]) || 0;
+      const finalNo = 1 - finalYes;
+
+      let actualOutcome = null;
+      if (finalYes >= 0.65) actualOutcome = 'yes';
+      else if (finalYes <= 0.35) actualOutcome = 'no';
+
+      if (!actualOutcome) {
+        skipped += byMarket.get(mid).length;
+        continue;
+      }
+
+      // Update all predictions for this market
+      for (const row of byMarket.get(mid)) {
+        const wasCorrect = row.predicted_outcome === actualOutcome;
+        const { error: upErr } = await db
+          .from('edge_predictions')
+          .update({
+            actual_outcome: actualOutcome,
+            was_correct: wasCorrect,
+            resolved_at: new Date().toISOString(),
+            final_yes_price: Number(finalYes.toFixed(4)),
+            final_no_price: Number(finalNo.toFixed(4)),
+            resolution_source: 'gamma',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', row.id);
+
+        if (upErr) {
+          console.error(`[edge] resolution update failed for prediction ${row.id}:`, upErr.message);
+        } else {
+          resolved++;
+          if (wasCorrect) correct++;
+          else incorrect++;
+        }
+      }
+    }
+
+    // Rate-limit pause between batches
+    if (i + 20 < marketIds.length) await new Promise(r => setTimeout(r, 300));
+  }
+
+  console.log(`[edge] resolved ${resolved} predictions (${correct} correct, ${incorrect} incorrect, ${skipped} skipped)`);
+}
+
+// ─── Accuracy stats ───
+
+const CATEGORY_PATTERNS = [
+  { category: 'weather', pattern: /weather|temperature|snow|rain|wind|forecast|°[CF]|humidity|storm/i },
+  { category: 'esports', pattern: /Counter-Strike|CS2|LoL|Dota|esport|Valorant|League of Legends|HOTU|BO[135]\b/i },
+  { category: 'earnings', pattern: /earnings|EPS|revenue|quarterly|beat.*earnings/i },
+  { category: 'politics', pattern: /Trump|Biden|election|congress|senate|vote|bill|executive order|legislation/i },
+  { category: 'sports', pattern: /NFL|NHL|UFC|boxing|tennis|golf|Formula|F1|NASCAR|Olympics/i },
+];
+
+function categorizeEvent(title) {
+  for (const { category, pattern } of CATEGORY_PATTERNS) {
+    if (pattern.test(title)) return category;
+  }
+  return 'other';
+}
+
+async function computeAccuracyStats(db) {
+  const { data: resolved, error } = await db
+    .from('edge_predictions')
+    .select('event_title, market_question, predicted_outcome, actual_outcome, was_correct, probability, reasoning')
+    .not('actual_outcome', 'is', null);
+
+  if (error) {
+    console.error('[edge] computeAccuracyStats query failed:', error.message);
+    return null;
+  }
+  if (!resolved || resolved.length === 0) {
+    console.log('[edge] no resolved predictions for accuracy stats');
+    return null;
+  }
+
+  const total = resolved.length;
+  const correctCount = resolved.filter(r => r.was_correct).length;
+
+  // By confidence bucket
+  const buckets = [
+    { bucket: '80-84', min: 80, max: 84, total: 0, correct: 0 },
+    { bucket: '85-89', min: 85, max: 89, total: 0, correct: 0 },
+    { bucket: '90-94', min: 90, max: 94, total: 0, correct: 0 },
+    { bucket: '95-100', min: 95, max: 100, total: 0, correct: 0 },
+  ];
+  for (const r of resolved) {
+    for (const b of buckets) {
+      if (r.probability >= b.min && r.probability <= b.max) {
+        b.total++;
+        if (r.was_correct) b.correct++;
+        break;
+      }
+    }
+  }
+
+  // By category
+  const catMap = new Map();
+  for (const r of resolved) {
+    const cat = categorizeEvent(r.event_title || '');
+    if (!catMap.has(cat)) catMap.set(cat, { total: 0, correct: 0 });
+    const c = catMap.get(cat);
+    c.total++;
+    if (r.was_correct) c.correct++;
+  }
+
+  // By predicted outcome
+  const byOutcome = { yes: { total: 0, correct: 0 }, no: { total: 0, correct: 0 } };
+  for (const r of resolved) {
+    const key = r.predicted_outcome === 'yes' ? 'yes' : 'no';
+    byOutcome[key].total++;
+    if (r.was_correct) byOutcome[key].correct++;
+  }
+
+  // Recent mistakes (last 20 wrong predictions)
+  const mistakes = resolved
+    .filter(r => !r.was_correct)
+    .slice(-20)
+    .map(r => ({
+      event_title: (r.event_title || '').slice(0, 100),
+      market_question: (r.market_question || '').slice(0, 120),
+      predicted: r.predicted_outcome,
+      actual: r.actual_outcome,
+      probability: r.probability,
+      reasoning: (r.reasoning || '').slice(0, 150),
+    }));
+
+  const stats = {
+    computed_at: new Date().toISOString(),
+    overall: {
+      total,
+      correct: correctCount,
+      accuracy: Number((correctCount / total).toFixed(3)),
+    },
+    by_confidence: buckets
+      .filter(b => b.total > 0)
+      .map(b => ({
+        bucket: b.bucket,
+        total: b.total,
+        correct: b.correct,
+        accuracy: Number((b.correct / b.total).toFixed(3)),
+      })),
+    by_category: [...catMap.entries()]
+      .map(([category, c]) => ({
+        category,
+        total: c.total,
+        correct: c.correct,
+        accuracy: Number((c.correct / c.total).toFixed(3)),
+      }))
+      .sort((a, b) => b.total - a.total),
+    by_outcome: {
+      yes: { ...byOutcome.yes, accuracy: byOutcome.yes.total > 0 ? Number((byOutcome.yes.correct / byOutcome.yes.total).toFixed(3)) : 0 },
+      no: { ...byOutcome.no, accuracy: byOutcome.no.total > 0 ? Number((byOutcome.no.correct / byOutcome.no.total).toFixed(3)) : 0 },
+    },
+    recent_mistakes: mistakes,
   };
 
-  if (rel.confidence >= cfg.RELATION_MIN_CONFIDENCE) {
-    if (rel.relation === 'mutually_exclusive') {
-      {
-        const gross = (pA + pB) - 1;
-        const net = gross - cfg.FEE_BUFFER_TWO_LEG;
-        maybeAdd(opps, {
-          ...base,
-          type: 'mutex_no_no',
-          strategy: 'Buy NO on both markets',
-          gross_edge: Number(gross.toFixed(6)),
-          net_edge: Number(net.toFixed(6)),
-          guaranteed_payout: 1.0,
-          total_cost: Number((2 - pA - pB).toFixed(6)),
-          exhaustive: !!rel.exhaustive,
-        });
-      }
-      if (rel.exhaustive === true) {
-        const gross = 1 - (pA + pB);
-        const net = gross - cfg.FEE_BUFFER_TWO_LEG;
-        maybeAdd(opps, {
-          ...base,
-          type: 'mutex_yes_yes_exhaustive',
-          strategy: 'Buy YES on both markets',
-          gross_edge: Number(gross.toFixed(6)),
-          net_edge: Number(net.toFixed(6)),
-          guaranteed_payout: 1.0,
-          total_cost: Number((pA + pB).toFixed(6)),
-          exhaustive: true,
-        });
-      }
-    }
-
-    if (rel.relation === 'equivalent') {
-      if (pA > pB) {
-        const gross = pA - pB;
-        const net = gross - cfg.FEE_BUFFER_TWO_LEG;
-        maybeAdd(opps, {
-          ...base,
-          type: 'equiv_spread',
-          strategy: 'Buy YES(B) + Buy NO(A)',
-          gross_edge: Number(gross.toFixed(6)),
-          net_edge: Number(net.toFixed(6)),
-          guaranteed_payout: 1.0,
-          total_cost: Number((1 + pB - pA).toFixed(6)),
-          exhaustive: false,
-        });
-      } else if (pB > pA) {
-        const gross = pB - pA;
-        const net = gross - cfg.FEE_BUFFER_TWO_LEG;
-        maybeAdd(opps, {
-          ...base,
-          type: 'equiv_spread',
-          strategy: 'Buy YES(A) + Buy NO(B)',
-          gross_edge: Number(gross.toFixed(6)),
-          net_edge: Number(net.toFixed(6)),
-          guaranteed_payout: 1.0,
-          total_cost: Number((1 + pA - pB).toFixed(6)),
-          exhaustive: false,
-        });
-      }
-    }
-
-    if (rel.relation === 'a_implies_b' && pA > pB) {
-      const gross = pA - pB;
-      const net = gross - cfg.FEE_BUFFER_TWO_LEG;
-      maybeAdd(opps, {
-        ...base,
-        type: 'implication_violation',
-        strategy: 'Buy YES(B) + Buy NO(A)',
-        gross_edge: Number(gross.toFixed(6)),
-        net_edge: Number(net.toFixed(6)),
-        guaranteed_payout: 1.0,
-        total_cost: Number((1 + pB - pA).toFixed(6)),
-        exhaustive: false,
-      });
-    }
-
-    if (rel.relation === 'b_implies_a' && pB > pA) {
-      const gross = pB - pA;
-      const net = gross - cfg.FEE_BUFFER_TWO_LEG;
-      maybeAdd(opps, {
-        ...base,
-        type: 'implication_violation',
-        strategy: 'Buy YES(A) + Buy NO(B)',
-        gross_edge: Number(gross.toFixed(6)),
-        net_edge: Number(net.toFixed(6)),
-        guaranteed_payout: 1.0,
-        total_cost: Number((1 + pA - pB).toFixed(6)),
-        exhaustive: false,
-      });
-    }
+  try {
+    ensureDirs();
+    writeFileSync(ACCURACY_STATS_FILE, JSON.stringify(stats, null, 2));
+    console.log(`[edge] accuracy: ${correctCount}/${total} (${(stats.overall.accuracy * 100).toFixed(1)}%) — saved to ${ACCURACY_STATS_FILE}`);
+  } catch (e) {
+    console.error('[edge] failed to write accuracy stats:', e.message);
   }
 
-  if (rel.confidence >= cfg.IMPOSSIBLE_MIN_CONFIDENCE && Array.isArray(rel.impossible_yes)) {
-    if (rel.impossible_yes.includes('a')) {
-      const gross = pA;
-      const net = gross - cfg.FEE_BUFFER_SINGLE_LEG;
-      maybeAdd(opps, {
-        ...base,
-        type: 'impossible_yes',
-        strategy: 'Buy NO(A)',
-        gross_edge: Number(gross.toFixed(6)),
-        net_edge: Number(net.toFixed(6)),
-        guaranteed_payout: 1.0,
-        total_cost: Number((1 - pA).toFixed(6)),
-        exhaustive: false,
-      });
-    }
-    if (rel.impossible_yes.includes('b')) {
-      const gross = pB;
-      const net = gross - cfg.FEE_BUFFER_SINGLE_LEG;
-      maybeAdd(opps, {
-        ...base,
-        type: 'impossible_yes',
-        strategy: 'Buy NO(B)',
-        gross_edge: Number(gross.toFixed(6)),
-        net_edge: Number(net.toFixed(6)),
-        guaranteed_payout: 1.0,
-        total_cost: Number((1 - pB).toFixed(6)),
-        exhaustive: false,
-      });
-    }
-  }
-
-  return opps;
+  return stats;
 }
+
+function loadAccuracyStats() {
+  try {
+    if (!existsSync(ACCURACY_STATS_FILE)) return null;
+    const raw = JSON.parse(readFileSync(ACCURACY_STATS_FILE, 'utf-8'));
+    if (!raw?.overall || raw.overall.total < CALIBRATION_MIN_SAMPLES) return null;
+    return raw;
+  } catch {
+    return null;
+  }
+}
+
+// ─── Report helpers ───
 
 function tsFile() {
   const d = new Date();
@@ -693,173 +776,204 @@ function tsFile() {
 
 function toMarkdown(summary, opportunities) {
   const lines = [];
-  lines.push(`# Logic-Edge Scanner Report`);
+  lines.push('# Edge Prediction Scanner Report');
   lines.push('');
   lines.push(`- Generated at: ${summary.generated_at}`);
   lines.push(`- Events scanned: ${summary.events_scanned}`);
-  lines.push(`- Pair candidates: ${summary.candidates}`);
-  lines.push(`- Pair analyses: ${summary.analyzed_pairs}`);
+  lines.push(`- Events analyzed: ${summary.events_analyzed}`);
+  lines.push(`- Predictions made: ${summary.predictions_total}`);
   lines.push(`- Opportunities: ${summary.opportunities_found}`);
+  lines.push(`- Alerts sent: ${summary.alerts_sent}`);
   lines.push('');
-  lines.push('| Net Edge | Type | Strategy | Relation | Confidence | Event |');
-  lines.push('|---:|---|---|---|---:|---|');
+  lines.push('| Profit % | Prob % | Outcome | Market | Event |');
+  lines.push('|---:|---:|---|---|---|');
   for (const o of opportunities.slice(0, cfg.REPORT_TOP_N)) {
     lines.push(
-      `| ${(o.net_edge * 100).toFixed(2)}% | ${o.type} | ${o.strategy} | ${o.relation} | ${o.confidence} | ${o.event_title.replace(/\|/g, '\\|')} |`
+      `| ${Number(o.profit_pct).toFixed(1)}% | ${o.probability}% | ${o.predicted_outcome} | ${o.market_question?.replace(/\|/g, '\\|')?.slice(0, 60)} | ${o.event_title?.replace(/\|/g, '\\|')?.slice(0, 40)} |`
     );
   }
   lines.push('');
+  if (summary.accuracy) {
+    lines.push('## Prediction Accuracy');
+    lines.push(`- Resolved: ${summary.accuracy.total_resolved} predictions`);
+    if (summary.accuracy.overall_accuracy != null) {
+      lines.push(`- Overall accuracy: ${(summary.accuracy.overall_accuracy * 100).toFixed(1)}%`);
+    }
+    if (summary.accuracy.weakest_category) {
+      lines.push(`- Weakest category: ${summary.accuracy.weakest_category} (${(summary.accuracy.weakest_accuracy * 100).toFixed(1)}%)`);
+    }
+    lines.push('');
+  }
   lines.push('## Notes');
-  lines.push('- `net_edge` is discounted by configurable fee/slippage buffers.');
-  lines.push('- This report is for signal generation; always verify resolution rules manually before execution.');
+  lines.push('- Only shows markets with AI probability >= configured minimum and profit >= minimum.');
+  lines.push('- Profit = ((1 - buy_price) / buy_price) * 100');
   return lines.join('\n');
 }
 
-function topReasonArray(reasonMap, max = 6) {
-  return [...reasonMap.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, max)
-    .map(([reason, count]) => ({ reason, count }));
-}
-
-function publicSummaryConfig(config) {
-  return {
-    PYTHON_CMD: config.PYTHON_CMD,
-    BRIDGE_PATH: config.BRIDGE_PATH,
-    GAMMA_BASE: config.GAMMA_BASE,
-    EDGE_CLOB_BASE: config.EDGE_CLOB_BASE,
-    HORIZON_HOURS: config.HORIZON_HOURS,
-    MAX_EVENTS: config.MAX_EVENTS,
-    MAX_MARKETS_PER_EVENT: config.MAX_MARKETS_PER_EVENT,
-    MAX_PAIRS_PER_EVENT: config.MAX_PAIRS_PER_EVENT,
-    MAX_PAIR_CHECKS: config.MAX_PAIR_CHECKS,
-    MIN_SHARED_TOKENS: config.MIN_SHARED_TOKENS,
-    MIN_YES_PRICE: config.MIN_YES_PRICE,
-    MAX_YES_PRICE: config.MAX_YES_PRICE,
-    PREFILTER_SUM_EXCESS: config.PREFILTER_SUM_EXCESS,
-    PREFILTER_DIFF: config.PREFILTER_DIFF,
-    PREFILTER_HIGH_PRICE: config.PREFILTER_HIGH_PRICE,
-    RELATION_MIN_CONFIDENCE: config.RELATION_MIN_CONFIDENCE,
-    IMPOSSIBLE_MIN_CONFIDENCE: config.IMPOSSIBLE_MIN_CONFIDENCE,
-    FEE_BUFFER_TWO_LEG: config.FEE_BUFFER_TWO_LEG,
-    FEE_BUFFER_SINGLE_LEG: config.FEE_BUFFER_SINGLE_LEG,
-    MIN_NET_EDGE: config.MIN_NET_EDGE,
-    CACHE_TTL_HOURS: config.CACHE_TTL_HOURS,
-    REPORT_TOP_N: config.REPORT_TOP_N,
-    MAX_BRIDGE_WORKERS: config.MAX_BRIDGE_WORKERS,
-    PAIR_QUERY_RETRIES: config.PAIR_QUERY_RETRIES,
-    PAIR_RETRY_BACKOFF_MS: config.PAIR_RETRY_BACKOFF_MS,
-    EDGE_TELEGRAM_ENABLED: config.EDGE_TELEGRAM_ENABLED,
-    EDGE_ALERT_MIN_NET_EDGE: config.EDGE_ALERT_MIN_NET_EDGE,
-    EDGE_ALERT_MIN_CONFIDENCE: config.EDGE_ALERT_MIN_CONFIDENCE,
-    EDGE_ALERT_DEDUPE_HOURS: config.EDGE_ALERT_DEDUPE_HOURS,
-    EDGE_ALERT_TOP_N: config.EDGE_ALERT_TOP_N,
-    EDGE_LIVE_RECHECK_TIMEOUT_MS: config.EDGE_LIVE_RECHECK_TIMEOUT_MS,
-    EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT: config.EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT,
-  };
-}
+// ─── Main ───
 
 async function main() {
-  console.log('[edge] starting standalone logic-edge scanner');
-  console.log(`[edge] python_cmd=${cfg.PYTHON_CMD}`);
-  const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN || '';
-  const telegramChatId = process.env.TELEGRAM_CHAT_ID || '';
-  const telegramConfigured = !!telegramBotToken && !!telegramChatId;
-  const telegramReady = cfg.EDGE_TELEGRAM_ENABLED && telegramConfigured;
-  if (cfg.EDGE_TELEGRAM_ENABLED && !telegramConfigured) {
-    console.warn('[edge] WARN: Telegram enabled but TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing; alerts disabled for this run');
-  } else if (!cfg.EDGE_TELEGRAM_ENABLED) {
-    console.log('[edge] Telegram alerts disabled by EDGE_TELEGRAM_ENABLED=false');
-  }
-
+  console.log('[edge] Starting prediction scanner...');
   const db = createClient(cfg.SUPABASE_URL, cfg.SUPABASE_KEY);
 
+  // ─── Resolution tracking & accuracy stats (before scan) ───
+  await checkResolutions(db);
+  await computeAccuracyStats(db);
+  const calibration = loadAccuracyStats();
+  if (calibration) {
+    console.log(`[edge] calibration loaded: ${calibration.overall.correct}/${calibration.overall.total} (${(calibration.overall.accuracy * 100).toFixed(1)}%)`);
+  }
+
+  // Fetch events ending within horizon
   const events = await fetchEvents(db);
-  console.log(`[edge] fetched ${events.length} events`);
-  const candidates = buildCandidates(events);
-  console.log(`[edge] built ${candidates.length} candidate pairs`);
+  console.log(`[edge] Found ${events.length} events ending within ${cfg.HORIZON_HOURS}h + ${cfg.HORIZON_BUFFER_MINS}m`);
 
-  const cache = loadCache();
-  const opportunities = [];
-  let analyzedPairs = 0;
-  let cacheHits = 0;
-  let failedPairs = 0;
-  const failReasons = new Map();
-  let uncachedPairs = 0;
-  let alertsAttempted = 0;
-  let alertsSent = 0;
-  let alertsSkippedDedupe = 0;
-  let alertsSkippedRecheck = 0;
-  let alertsFailedSend = 0;
-  const alertSkipReasons = new Map();
-
-  const queue = [...candidates];
-  if (queue.length === 0) {
-    const summary = {
-      generated_at: new Date().toISOString(),
-      config: publicSummaryConfig(cfg),
-      events_scanned: events.length,
-      candidates: 0,
-      analyzed_pairs: 0,
-      cache_hits: 0,
-      failed_pairs: 0,
-      alerts_enabled: cfg.EDGE_TELEGRAM_ENABLED,
-      alerts_ready: telegramReady,
-      alerts_attempted: 0,
-      alerts_sent: 0,
-      alerts_skipped_dedupe: 0,
-      alerts_skipped_recheck: 0,
-      alerts_failed_send: 0,
-      alert_skip_reasons_top: [],
-      opportunities_found: 0,
-    };
-    ensureDirs();
-    const stamp = tsFile();
-    const payload = { summary, opportunities: [] };
-    writeFileSync(join(REPORT_DIR, 'latest.json'), JSON.stringify(payload, null, 2));
-    writeFileSync(join(REPORT_DIR, `edge-${stamp}.json`), JSON.stringify(payload, null, 2));
-    const md = toMarkdown(summary, []);
-    writeFileSync(join(REPORT_DIR, 'latest.md'), md);
-    writeFileSync(join(REPORT_DIR, `edge-${stamp}.md`), md);
-    console.log('[edge] no candidates, report generated');
+  if (events.length === 0) {
+    console.log('[edge] No events to analyze. Done.');
     return;
   }
 
+  // Gamma pre-flight: remove already-closed events
+  let gammaFiltered = 0;
+  const openEvents = [];
+  for (const event of events) {
+    const closed = await isEventClosedOnGamma(event);
+    if (closed) {
+      gammaFiltered++;
+      continue;
+    }
+    openEvents.push(event);
+  }
+  console.log(`[edge] ${openEvents.length} open events (${gammaFiltered} closed on Gamma)`);
+
+  if (openEvents.length === 0) {
+    console.log('[edge] All events closed. Done.');
+    return;
+  }
+
+  // Setup bridge pool
   const tokens = getPerplexityTokens();
-  console.log(`[edge] using ${tokens.length} Perplexity token(s)`);
-  const pool = new BridgePool(tokens);
-  const workerCap = Math.max(1, Math.floor(cfg.MAX_BRIDGE_WORKERS));
-  const workerCount = Math.min(tokens.length, workerCap, queue.length || 1);
-  console.log(`[edge] bridge_workers=${workerCount}`);
+  const workerCount = Math.min(tokens.length, cfg.MAX_BRIDGE_WORKERS, openEvents.length);
+  const pool = new BridgePool(tokens.slice(0, workerCount));
+  console.log(`[edge] Bridge pool: ${workerCount} workers`);
+
+  // Load cache
+  const cache = loadCache();
+  let cacheHits = 0;
+  let analyzedEvents = 0;
+  let failedEvents = 0;
+  const failReasons = new Map();
+
+  // Process events
+  const allPredictions = []; // all market predictions (stored to DB)
+  const opportunities = [];  // high-confidence, high-profit ones (for alerts)
+
+  // Worker queue
+  const queue = [...openEvents];
+  let queueIdx = 0;
 
   async function worker() {
-    while (queue.length > 0) {
-      const c = queue.shift();
-      if (!c) break;
-      const key = cacheKey(c);
-      let rel = null;
-      if (isCacheFresh(cache[key])) {
-        rel = cache[key].result;
+    while (queueIdx < queue.length) {
+      const event = queue[queueIdx++];
+      if (!event) break;
+
+      const ck = predictionCacheKey(event);
+      let result;
+
+      // Check cache
+      if (cache[ck] && isCacheFresh(cache[ck])) {
+        result = cache[ck].result;
         cacheHits++;
       } else {
-        uncachedPairs++;
+        // Query Perplexity
+        const payload = buildPayload(event, calibration);
         try {
-          rel = await queryWithRetries(pool, relationPayload(c));
-          cache[key] = {
-            cached_at: new Date().toISOString(),
-            result: rel,
-          };
+          result = await queryWithRetries(pool, payload);
+          cache[ck] = { cached_at: new Date().toISOString(), result };
         } catch (e) {
-          failedPairs++;
+          failedEvents++;
           const msg = normalizeErrorMessage(e?.message || e);
           failReasons.set(msg, (failReasons.get(msg) || 0) + 1);
           continue;
         }
       }
 
-      analyzedPairs++;
-      const opps = evaluate(c, rel);
-      opportunities.push(...opps);
+      analyzedEvents++;
+
+      // Process each market prediction
+      if (!result?.markets || !Array.isArray(result.markets)) continue;
+
+      for (const mResult of result.markets) {
+        const marketIdx = (mResult.market || 1) - 1;
+        const market = event.markets[marketIdx];
+        if (!market) continue;
+
+        const outcome = mResult.outcome;
+        const probability = mResult.probability;
+        const reasoning = mResult.reasoning || '';
+
+        // Fetch live price
+        const livePrice = await fetchLivePrices(market);
+        if (!livePrice) continue;
+        if (livePrice.closed) continue;
+
+        // Calculate buy price and profit
+        const buyPrice = outcome === 'yes' ? livePrice.yesPrice : livePrice.noPrice;
+        const profitPct = buyPrice > 0 ? ((1.0 - buyPrice) / buyPrice) * 100 : 0;
+
+        const prediction = {
+          event_id: event.polymarket_event_id,
+          event_title: event.title,
+          event_slug: event.slug || '',
+          event_end_date: event.end_date,
+          market_id: market.polymarket_market_id,
+          market_question: market.question,
+          market_slug: market.slug || '',
+          predicted_outcome: outcome,
+          probability,
+          reasoning,
+          ai_summary: result.summary || '',
+          yes_price: livePrice.yesPrice,
+          no_price: livePrice.noPrice,
+          divergence: outcome === 'yes'
+            ? Math.abs((probability / 100) - livePrice.yesPrice)
+            : Math.abs((probability / 100) - livePrice.noPrice),
+          profit_pct: Number(profitPct.toFixed(2)),
+          detected_at: new Date().toISOString(),
+          event_url: marketUrl(event.slug, ''),
+          market_url: marketUrl(event.slug, market.slug),
+        };
+
+        // Store ALL predictions to DB
+        allPredictions.push(prediction);
+        await upsertEdgePrediction(db, {
+          event_id: prediction.event_id,
+          event_title: prediction.event_title,
+          event_slug: prediction.event_slug,
+          event_end_date: prediction.event_end_date,
+          market_id: prediction.market_id,
+          market_question: prediction.market_question,
+          predicted_outcome: prediction.predicted_outcome,
+          probability: prediction.probability,
+          reasoning: prediction.reasoning,
+          ai_summary: prediction.ai_summary,
+          yes_price: prediction.yes_price,
+          no_price: prediction.no_price,
+          divergence: prediction.divergence,
+          profit_pct: prediction.profit_pct,
+          detected_at: prediction.detected_at,
+        });
+
+        // Check if it's an opportunity
+        if (
+          probability >= cfg.MIN_PROBABILITY &&
+          buyPrice < cfg.MAX_BUY_PRICE &&
+          profitPct >= cfg.MIN_PROFIT_PCT &&
+          outcome !== 'unknown'
+        ) {
+          opportunities.push(prediction);
+        }
+      }
     }
   }
 
@@ -867,73 +981,87 @@ async function main() {
   pool.close();
   saveCache(cache);
 
-  const failTop = [...failReasons.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 5)
-    .map(([reason, count]) => ({ count, reason }));
+  // Sort opportunities by profit descending
+  opportunities.sort((a, b) => b.profit_pct - a.profit_pct);
 
-  if (failTop.length > 0) {
-    for (const f of failTop) {
-      console.warn(`[edge] fail_reason x${f.count}: ${f.reason}`);
-    }
-  }
+  console.log(`[edge] analyzed=${analyzedEvents} cache_hits=${cacheHits} failed=${failedEvents}`);
+  console.log(`[edge] predictions=${allPredictions.length} opportunities=${opportunities.length}`);
 
-  // Hard fail only if no uncached pair could be analyzed successfully.
-  if (uncachedPairs > 0 && analyzedPairs - cacheHits <= 0 && failedPairs >= uncachedPairs) {
-    const firstReason = failTop[0]?.reason || 'unknown error';
-    throw new Error(
-      `All uncached pair analyses failed (${failedPairs}/${uncachedPairs}). Top error: ${firstReason}`
-    );
-  }
+  // ─── Telegram alerts ───
 
-  opportunities.sort((a, b) => {
-    if (b.net_edge !== a.net_edge) return b.net_edge - a.net_edge;
-    return b.confidence - a.confidence;
-  });
+  const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN || '';
+  const telegramChatId = process.env.TELEGRAM_CHAT_ID || '';
+  const telegramConfigured = !!(telegramBotToken && telegramChatId);
+  const telegramReady = cfg.TELEGRAM_ENABLED && telegramConfigured;
+
+  let alertsSent = 0;
+  let alertsSkippedDedupe = 0;
+  let alertsSkippedRecheck = 0;
+  let alertsFailedSend = 0;
+  const alertSkipReasons = new Map();
 
   if (telegramReady) {
-    const alertState = loadAlertState(ALERT_STATE_FILE, Math.max(cfg.EDGE_ALERT_DEDUPE_HOURS * 4, 24 * 7));
-    const alertCandidates = opportunities
-      .filter(op => Number(op.net_edge) >= cfg.EDGE_ALERT_MIN_NET_EDGE)
-      .filter(op => Number(op.confidence) >= cfg.EDGE_ALERT_MIN_CONFIDENCE)
-      .slice(0, cfg.EDGE_ALERT_TOP_N);
+    const alertState = loadAlertState(ALERT_STATE_FILE, Math.max(cfg.ALERT_DEDUPE_HOURS * 4, 24 * 7));
+    const alertCandidates = opportunities.slice(0, cfg.ALERT_TOP_N);
 
     for (const op of alertCandidates) {
-      const dedupeKey = `${op.event_id}|${op.market_a_id}|${op.market_b_id}|${op.type}`;
+      const dedupeKey = `${op.event_id}|${op.market_id}|${op.predicted_outcome}`;
 
-      if (isDuplicateWithinWindow(alertState, dedupeKey, cfg.EDGE_ALERT_DEDUPE_HOURS)) {
+      if (isDuplicateWithinWindow(alertState, dedupeKey, cfg.ALERT_DEDUPE_HOURS)) {
         alertsSkippedDedupe++;
         alertSkipReasons.set('duplicate_within_window', (alertSkipReasons.get('duplicate_within_window') || 0) + 1);
         continue;
       }
 
-      const recheck = await recheckOpportunityLive(op, {
-        gammaBase: cfg.GAMMA_BASE,
-        clobBase: cfg.EDGE_CLOB_BASE,
-        timeoutMs: cfg.EDGE_LIVE_RECHECK_TIMEOUT_MS,
-        maxPriceDrift: cfg.EDGE_LIVE_RECHECK_MAX_PRICE_DRIFT,
-        feeBufferTwoLeg: cfg.FEE_BUFFER_TWO_LEG,
-        feeBufferSingleLeg: cfg.FEE_BUFFER_SINGLE_LEG,
-        minNetEdge: cfg.EDGE_ALERT_MIN_NET_EDGE,
-      });
+      // Live recheck price before alerting
+      const market = allPredictions.find(p => p.market_id === op.market_id);
+      if (!market) continue;
 
-      if (!recheck.eligible || !recheck.liveOpportunity) {
+      // Re-fetch live price to confirm
+      const freshMarketData = { polymarket_market_id: op.market_id, best_ask: op.yes_price };
+      const liveCheck = await fetchLivePrices(freshMarketData);
+      if (!liveCheck || liveCheck.closed) {
         alertsSkippedRecheck++;
-        const rsn = recheck.reason || 'live_recheck_failed';
-        alertSkipReasons.set(rsn, (alertSkipReasons.get(rsn) || 0) + 1);
+        alertSkipReasons.set('market_closed_recheck', (alertSkipReasons.get('market_closed_recheck') || 0) + 1);
         continue;
       }
 
-      alertsAttempted++;
-      const send = await sendEdgeTelegramAlert(recheck.liveOpportunity, {
+      const freshBuyPrice = op.predicted_outcome === 'yes' ? liveCheck.yesPrice : liveCheck.noPrice;
+      if (freshBuyPrice >= cfg.MAX_BUY_PRICE) {
+        alertsSkippedRecheck++;
+        alertSkipReasons.set('price_above_max_recheck', (alertSkipReasons.get('price_above_max_recheck') || 0) + 1);
+        continue;
+      }
+
+      // Update with live prices
+      const alertData = {
+        ...op,
+        yes_price: liveCheck.yesPrice,
+        no_price: liveCheck.noPrice,
+        profit_pct: freshBuyPrice > 0 ? Number((((1.0 - freshBuyPrice) / freshBuyPrice) * 100).toFixed(2)) : 0,
+      };
+
+      const send = await sendEdgeTelegramAlert(alertData, {
         botToken: telegramBotToken,
         chatId: telegramChatId,
       });
+
       if (send.ok) {
         alertsSent++;
         markSent(alertState, dedupeKey, {
-          last_net_edge: recheck.liveOpportunity.net_edge,
-          last_confidence: recheck.liveOpportunity.confidence,
+          last_probability: op.probability,
+          last_profit_pct: alertData.profit_pct,
+        });
+        // Update DB with alert_sent
+        await upsertEdgePrediction(db, {
+          event_id: op.event_id,
+          market_id: op.market_id,
+          event_title: op.event_title,
+          market_question: op.market_question,
+          predicted_outcome: op.predicted_outcome,
+          probability: op.probability,
+          alert_sent: true,
+          alert_sent_at: new Date().toISOString(),
         });
       } else {
         alertsFailedSend++;
@@ -942,34 +1070,55 @@ async function main() {
       }
     }
 
-    saveAlertState(ALERT_STATE_FILE, alertState, Math.max(cfg.EDGE_ALERT_DEDUPE_HOURS * 4, 24 * 7));
-  }
-  else if (cfg.EDGE_TELEGRAM_ENABLED && !telegramConfigured) {
-    alertSkipReasons.set('telegram_not_configured', 1);
+    saveAlertState(ALERT_STATE_FILE, alertState, Math.max(cfg.ALERT_DEDUPE_HOURS * 4, 24 * 7));
   }
 
-  const alertSkipTop = topReasonArray(alertSkipReasons);
+  console.log(`[edge] alerts sent=${alertsSent} skip_dedupe=${alertsSkippedDedupe} skip_recheck=${alertsSkippedRecheck} failed_send=${alertsFailedSend}`);
+
+  // ─── Reports ───
+
+  const alertSkipTop = [...alertSkipReasons.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([reason, count]) => ({ reason, count }));
+
+  const failTop = [...failReasons.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([reason, count]) => ({ count, reason }));
 
   const summary = {
     generated_at: new Date().toISOString(),
-    config: publicSummaryConfig(cfg),
+    config: {
+      HORIZON_HOURS: cfg.HORIZON_HOURS,
+      HORIZON_BUFFER_MINS: cfg.HORIZON_BUFFER_MINS,
+      MAX_EVENTS: cfg.MAX_EVENTS,
+      MIN_PROBABILITY: cfg.MIN_PROBABILITY,
+      MAX_BUY_PRICE: cfg.MAX_BUY_PRICE,
+      MIN_PROFIT_PCT: cfg.MIN_PROFIT_PCT,
+      CACHE_TTL_HOURS: cfg.CACHE_TTL_HOURS,
+      MAX_BRIDGE_WORKERS: cfg.MAX_BRIDGE_WORKERS,
+      ALERT_DEDUPE_HOURS: cfg.ALERT_DEDUPE_HOURS,
+    },
     events_scanned: events.length,
-    candidates: candidates.length,
-    analyzed_pairs: analyzedPairs,
-    analyzed_uncached_pairs: Math.max(0, analyzedPairs - cacheHits),
+    events_filtered_gamma: gammaFiltered,
+    events_analyzed: analyzedEvents,
     cache_hits: cacheHits,
-    failed_pairs: failedPairs,
-    failed_uncached_pairs: failedPairs,
+    failed_events: failedEvents,
     fail_reasons_top: failTop,
-    alerts_enabled: cfg.EDGE_TELEGRAM_ENABLED,
-    alerts_ready: telegramReady,
-    alerts_attempted: alertsAttempted,
+    predictions_total: allPredictions.length,
+    opportunities_found: opportunities.length,
     alerts_sent: alertsSent,
     alerts_skipped_dedupe: alertsSkippedDedupe,
     alerts_skipped_recheck: alertsSkippedRecheck,
     alerts_failed_send: alertsFailedSend,
     alert_skip_reasons_top: alertSkipTop,
-    opportunities_found: opportunities.length,
+    accuracy: calibration ? {
+      total_resolved: calibration.overall.total,
+      overall_accuracy: calibration.overall.accuracy,
+      weakest_category: calibration.by_category?.filter(c => c.total >= 5).sort((a, b) => a.accuracy - b.accuracy)[0]?.category || null,
+      weakest_accuracy: calibration.by_category?.filter(c => c.total >= 5).sort((a, b) => a.accuracy - b.accuracy)[0]?.accuracy || null,
+    } : null,
   };
 
   ensureDirs();
@@ -986,19 +1135,8 @@ async function main() {
   writeFileSync(latestMd, md);
   writeFileSync(datedMd, md);
 
-  console.log(`[edge] analyzed=${analyzedPairs} cache_hits=${cacheHits} failed=${failedPairs}`);
-  console.log(`[edge] opportunities=${opportunities.length}`);
-  console.log(
-    `[edge] alerts attempted=${alertsAttempted} sent=${alertsSent} ` +
-    `skip_dedupe=${alertsSkippedDedupe} skip_recheck=${alertsSkippedRecheck} failed_send=${alertsFailedSend}`
-  );
-  if (alertSkipTop.length > 0) {
-    for (const s of alertSkipTop) {
-      console.log(`[edge] alert_skip x${s.count}: ${s.reason}`);
-    }
-  }
   if (opportunities[0]) {
-    console.log(`[edge] top: ${(opportunities[0].net_edge * 100).toFixed(2)}% ${opportunities[0].strategy} | ${opportunities[0].event_title}`);
+    console.log(`[edge] top: ${opportunities[0].profit_pct.toFixed(1)}% profit | ${opportunities[0].predicted_outcome} | ${opportunities[0].probability}% | ${opportunities[0].event_title}`);
   }
   console.log(`[edge] wrote ${latestJson}`);
   console.log(`[edge] wrote ${latestMd}`);

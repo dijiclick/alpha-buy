@@ -10,22 +10,22 @@ function escHtml(text) {
 function pct(x) {
   const n = Number(x);
   if (!Number.isFinite(n)) return '?';
-  return `${(n * 100).toFixed(2)}%`;
+  return `${n.toFixed(1)}%`;
 }
 
-function num(x) {
+function price(x) {
   const n = Number(x);
   if (!Number.isFinite(n)) return '?';
-  return n.toFixed(4);
+  return n.toFixed(2);
 }
 
-function short(text, max = 95) {
+function short(text, max = 120) {
   const s = String(text || '').trim();
   if (s.length <= max) return s;
   return `${s.slice(0, max - 3)}...`;
 }
 
-export async function sendEdgeTelegramAlert(opportunity, context = {}) {
+export async function sendEdgeTelegramAlert(prediction, context = {}) {
   const botToken = context.botToken;
   const chatId = context.chatId;
   if (!botToken || !chatId) {
@@ -33,55 +33,69 @@ export async function sendEdgeTelegramAlert(opportunity, context = {}) {
   }
 
   const lines = [];
-  lines.push('<b>EDGE SIGNAL</b>');
-  lines.push(
-    `${escHtml(opportunity.type)} | edge <b>${pct(opportunity.net_edge)}</b> | conf <b>${Number(opportunity.confidence || 0)}%</b>`
-  );
+
+  // Header
+  const emoji = prediction.predicted_outcome === 'yes' ? '\u{1F7E2}' : '\u{1F534}';
+  lines.push(`${emoji} <b>PREDICTION SIGNAL</b> | ${pct(prediction.probability)} confident`);
   lines.push('');
-  lines.push(`<b>${escHtml(opportunity.event_title)}</b>`);
-  lines.push(`<i>${escHtml(opportunity.strategy)}</i>`);
+
+  // Event
+  lines.push(`<b>${escHtml(prediction.event_title)}</b>`);
   lines.push('');
-  lines.push(`A: ${escHtml(short(opportunity.market_a_question))} (${pct(opportunity.market_a_yes)})`);
-  lines.push(`B: ${escHtml(short(opportunity.market_b_question))} (${pct(opportunity.market_b_yes)})`);
-  if (Number.isFinite(Number(opportunity.gross_edge))) {
-    lines.push(`gross ${pct(opportunity.gross_edge)} | net ${pct(opportunity.net_edge)}`);
-  }
 
-  if (Number.isFinite(Number(opportunity.live_total_cost))) {
-    lines.push(`live total cost: ${num(opportunity.live_total_cost)}`);
-  }
-
-  if (opportunity.live_quote_source) {
-    lines.push(`source: ${escHtml(opportunity.live_quote_source)}`);
-  }
-
-  const qa = opportunity.live_quotes?.market_a;
-  const qb = opportunity.live_quotes?.market_b;
-  if (qa) {
-    lines.push(`A YES ask ${num(qa.yesAsk)} | A NO ask ${num(qa.noAsk)}`);
-  }
-  if (qb) {
-    lines.push(`B YES ask ${num(qb.yesAsk)} | B NO ask ${num(qb.noAsk)}`);
-  }
-
-  const costDrift = Number(opportunity.live_cost_drift);
-  if (Number.isFinite(costDrift)) {
-    lines.push(`cost drift: ${pct(costDrift)}`);
-  }
-
-  const drift = Number(opportunity.live_price_drift_max);
-  if (Number.isFinite(drift)) {
-    lines.push(`yes drift(max): ${pct(drift)}`);
-  }
-
-  const evUrl = opportunity.market_a_url || opportunity.market_b_url || '';
-  const mkA = opportunity.market_a_url || '';
-  const mkB = opportunity.market_b_url || '';
+  // Market question
+  lines.push(`<b>Market:</b> ${escHtml(short(prediction.market_question))}`);
   lines.push('');
-  if (evUrl) lines.push(`<a href="${escHtml(evUrl)}">Open</a>`);
-  if (mkA && mkB && mkA !== mkB) {
-    lines.push(`<a href="${escHtml(mkA)}">Market A</a> | <a href="${escHtml(mkB)}">Market B</a>`);
+
+  // AI prediction
+  const outcomeLabel = prediction.predicted_outcome.toUpperCase();
+  lines.push(`<b>AI Prediction:</b> ${outcomeLabel} (${pct(prediction.probability)})`);
+
+  // Current prices
+  if (prediction.yes_price != null) {
+    lines.push(`<b>Current Price:</b> YES ${price(prediction.yes_price)} / NO ${price(prediction.no_price)}`);
   }
+
+  // Profit
+  if (prediction.profit_pct != null) {
+    lines.push(`<b>Profit:</b> ~${pct(prediction.profit_pct)}`);
+  }
+
+  // Divergence
+  if (prediction.divergence != null) {
+    lines.push(`<b>Divergence:</b> ${pct(prediction.divergence * 100)}`);
+  }
+
+  lines.push('');
+
+  // Reasoning
+  if (prediction.reasoning) {
+    lines.push(`<i>${escHtml(short(prediction.reasoning, 200))}</i>`);
+    lines.push('');
+  }
+
+  // Action
+  const buyOutcome = prediction.predicted_outcome.toUpperCase();
+  const buyPrice = prediction.predicted_outcome === 'yes' ? prediction.yes_price : prediction.no_price;
+  if (buyPrice != null) {
+    lines.push(`<b>Action:</b> Buy ${buyOutcome} @ ${price(buyPrice)}`);
+    lines.push('');
+  }
+
+  // End date
+  if (prediction.event_end_date) {
+    const d = new Date(prediction.event_end_date);
+    if (!isNaN(d.getTime())) {
+      const fmt = d.toLocaleString('en-US', { timeZone: 'America/New_York', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+      lines.push(`\u{1F4C5} ${fmt} ET`);
+    }
+  }
+
+  // Links
+  const eventUrl = prediction.event_url || '';
+  const marketUrl = prediction.market_url || '';
+  if (eventUrl) lines.push(`<a href="${escHtml(eventUrl)}">Event</a>`);
+  if (marketUrl && marketUrl !== eventUrl) lines.push(`<a href="${escHtml(marketUrl)}">Market</a>`);
 
   const payload = {
     chat_id: chatId,

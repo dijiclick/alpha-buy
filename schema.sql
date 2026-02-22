@@ -63,3 +63,35 @@ CREATE TABLE IF NOT EXISTS outcomes (
   profit_pct numeric,
   updated_at timestamptz DEFAULT now()
 );
+
+-- Edge predictions table (AI outcome predictions for near-term events)
+CREATE TABLE IF NOT EXISTS edge_predictions (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  event_id text NOT NULL,
+  event_title text NOT NULL,
+  event_slug text,
+  event_end_date timestamptz,
+  market_id text NOT NULL,
+  market_question text NOT NULL,
+  predicted_outcome text NOT NULL,
+  probability int NOT NULL DEFAULT 0,
+  reasoning text,
+  ai_summary text,
+  yes_price numeric(6,4),
+  no_price numeric(6,4),
+  best_ask numeric(6,4),
+  best_bid numeric(6,4),
+  divergence numeric(6,4),
+  profit_pct numeric(8,4),
+  alert_sent boolean DEFAULT false,
+  alert_sent_at timestamptz,
+  actual_outcome text,
+  was_correct boolean,
+  resolved_at timestamptz,
+  final_yes_price numeric(6,4),
+  final_no_price numeric(6,4),
+  resolution_source text,
+  detected_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
+  UNIQUE(event_id, market_id)
+);

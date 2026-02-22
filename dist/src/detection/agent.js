@@ -903,7 +903,15 @@ async function writeEventResults(event, result) {
             });
         }
 
-        await sendTelegramAlert(event, alertMarket.market, { ...result, outcome: 'yes' }, prices, profitPct);
+        // Skip alert if profit is too low (market already priced in)
+        const MIN_PROFIT_PCT = 5;
+        if (profitPct !== null && profitPct < MIN_PROFIT_PCT) {
+            log.info(`SKIP ALERT (profit ${profitPct.toFixed(1)}% < ${MIN_PROFIT_PCT}%): "${event.title.slice(0, 60)}"`);
+        } else if (prices && prices.type === 'resolved' && !realPrices) {
+            log.info(`SKIP ALERT (no live prices, market likely settled): "${event.title.slice(0, 60)}"`);
+        } else {
+            await sendTelegramAlert(event, alertMarket.market, { ...result, outcome: 'yes' }, prices, profitPct);
+        }
     } else {
         log.warn(`NO YES: "${event.title.slice(0, 60)}" answer="${result.answer}"`);
     }

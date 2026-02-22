@@ -3,31 +3,32 @@
 # dependencies = ["perplexity-webui-scraper"]
 # ///
 """
-Standalone Perplexity bridge for logical-constraint analysis between two markets.
+Perplexity bridge for outcome prediction on near-term prediction markets.
 
 Protocol (JSON line in, JSON line out):
 Input:
 {
   "event_title": "...",
   "event_description": "...",
-  "scheduled_end": "2026-02-22T20:00:00Z",
-  "market_a": {"id": "...", "question": "...", "description": "...", "yes_price": 0.62},
-  "market_b": {"id": "...", "question": "...", "description": "...", "yes_price": 0.55}
+  "end_date": "2026-02-22T20:00:00Z",
+  "market_questions": ["Q1", "Q2", ...],
+  "market_descriptions": ["D1", "D2", ...]
 }
 
 Output:
 {
-  "relation": "equivalent|mutually_exclusive|a_implies_b|b_implies_a|unrelated",
-  "exhaustive": false,
-  "impossible_yes": ["a"|"b", ...],
+  "markets": [
+    {"market": 1, "outcome": "yes/no/unknown", "probability": 0-100, "reasoning": "..."},
+    ...
+  ],
   "confidence": 0-100,
-  "reason": "...",
-  "evidence": [{"title":"...","date":"YYYY-MM-DD or unknown","url":"https://..."}, ...]
+  "summary": "max 15 words"
 }
 """
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import date
@@ -60,24 +61,6 @@ SESSION_ERROR_PATTERNS = [
     "captcha",
     "cloudflare",
 ]
-
-RELATION_ALIASES = {
-    "equivalent": "equivalent",
-    "same": "equivalent",
-    "same_truth_value": "equivalent",
-    "mutually_exclusive": "mutually_exclusive",
-    "mutex": "mutually_exclusive",
-    "cannot_both_be_true": "mutually_exclusive",
-    "a_implies_b": "a_implies_b",
-    "implies_a_to_b": "a_implies_b",
-    "a=>b": "a_implies_b",
-    "b_implies_a": "b_implies_a",
-    "implies_b_to_a": "b_implies_a",
-    "b=>a": "b_implies_a",
-    "unrelated": "unrelated",
-    "independent": "unrelated",
-    "none": "unrelated",
-}
 
 
 def log(level, msg):
@@ -112,147 +95,244 @@ def sanitize_text(text):
     return text.encode("utf-8", errors="ignore").decode("utf-8")
 
 
-def _normalize_relation(raw):
-    key = _safe_str(raw).strip().lower().replace(" ", "_")
-    return RELATION_ALIASES.get(key, "unrelated")
+def build_calibration_section(calibration):
+    """Build a concise calibration section from past accuracy stats."""
+    if not calibration:
+        return ""
+    overall = calibration.get("overall", {})
+    if overall.get("total", 0) < 20:
+        return ""
 
+    lines = []
+    lines.append("CALIBRATION (from your past predictions on this platform):")
+    lines.append(
+        f"- Overall accuracy: {overall['correct']}/{overall['total']} "
+        f"({overall['accuracy']:.0%})"
+    )
 
-def _normalize_impossible(raw):
-    if isinstance(raw, str):
-        raw_items = [x.strip().lower() for x in raw.replace(";", ",").split(",")]
-    elif isinstance(raw, list):
-        raw_items = [_safe_str(x).strip().lower() for x in raw]
-    else:
-        raw_items = []
-
-    out = []
-    for item in raw_items:
-        if item in ("a", "market_a", "a_yes", "yes_a"):
-            out.append("a")
-        elif item in ("b", "market_b", "b_yes", "yes_b"):
-            out.append("b")
-    # dedupe, stable order
-    deduped = []
-    for x in out:
-        if x not in deduped:
-            deduped.append(x)
-    return deduped
-
-
-def _normalize_evidence(raw):
-    if not isinstance(raw, list):
-        return []
-
-    out = []
-    for item in raw[:4]:
-        if isinstance(item, dict):
-            title = _safe_str(item.get("title", "")).strip()
-            dt = _safe_str(item.get("date", "")).strip()
-            url = _safe_str(item.get("url", "")).strip()
-        else:
-            title = _safe_str(item).strip()
-            dt = "unknown"
-            url = ""
-        if not title and not url:
+    # Confidence calibration issues
+    buckets = calibration.get("by_confidence", [])
+    for b in buckets:
+        if b.get("total", 0) < 5:
             continue
-        out.append(
-            {
-                "title": title[:180],
-                "date": dt if dt else "unknown",
-                "url": url[:500],
-            }
-        )
-    return out
+        parts = b["bucket"].split("-")
+        expected_mid = (int(parts[0]) + int(parts[1])) / 200
+        if b["accuracy"] < expected_mid - 0.15:
+            lines.append(
+                f"- WARNING: At {b['bucket']}% confidence your actual accuracy "
+                f"is {b['accuracy']:.0%} — you are OVERCONFIDENT in this range"
+            )
+
+    # Weak categories
+    categories = calibration.get("by_category", [])
+    weak = [c for c in categories if c.get("total", 0) >= 5 and c["accuracy"] < 0.65]
+    if weak:
+        lines.append("- Weak categories (accuracy < 65%):")
+        for c in weak:
+            lines.append(
+                f"  * {c['category']}: {c['accuracy']:.0%} "
+                f"({c['correct']}/{c['total']})"
+            )
+
+    # Outcome bias
+    by_outcome = calibration.get("by_outcome", {})
+    yes_acc = by_outcome.get("yes", {})
+    no_acc = by_outcome.get("no", {})
+    if yes_acc.get("total", 0) >= 10 and no_acc.get("total", 0) >= 10:
+        diff = abs(yes_acc["accuracy"] - no_acc["accuracy"])
+        if diff > 0.15:
+            weaker = "YES" if yes_acc["accuracy"] < no_acc["accuracy"] else "NO"
+            lines.append(
+                f"- Bias: Your {weaker} predictions are less accurate — "
+                f"be more cautious when predicting {weaker}"
+            )
+
+    # Recent mistakes (max 5)
+    mistakes = calibration.get("recent_mistakes", [])[:5]
+    if mistakes:
+        lines.append("- Recent wrong predictions (learn from these):")
+        for m in mistakes:
+            lines.append(
+                f"  * Predicted {m['predicted'].upper()} ({m['probability']}%) "
+                f"but actual was {m['actual'].upper()}: "
+                f"\"{m['market_question'][:80]}\""
+            )
+
+    lines.append("")
+    return "\n".join(lines) + "\n"
 
 
 def build_prompt(input_data):
     event_title = sanitize_text(_safe_str(input_data.get("event_title", "")))
     event_desc = sanitize_text(_safe_str(input_data.get("event_description", "")))
-    scheduled_end = sanitize_text(_safe_str(input_data.get("scheduled_end", "")))
+    end_date = sanitize_text(_safe_str(input_data.get("end_date", "")))
+    questions = input_data.get("market_questions", [])
+    descriptions = input_data.get("market_descriptions", [])
+    calibration = input_data.get("calibration")
 
-    market_a = input_data.get("market_a", {}) or {}
-    market_b = input_data.get("market_b", {}) or {}
+    mq_lines = []
+    for i, q in enumerate(questions):
+        mq_lines.append(f"  {i+1}. {q}")
+        if i < len(descriptions) and descriptions[i]:
+            rule = descriptions[i][:500]
+            mq_lines.append(f"     Resolution rules: {rule}")
+    mq_list = "\n".join(mq_lines)
 
-    q_a = sanitize_text(_safe_str(market_a.get("question", "")))
-    d_a = sanitize_text(_safe_str(market_a.get("description", "")))
-    p_a = _safe_str(market_a.get("yes_price", ""))
-
-    q_b = sanitize_text(_safe_str(market_b.get("question", "")))
-    d_b = sanitize_text(_safe_str(market_b.get("description", "")))
-    p_b = _safe_str(market_b.get("yes_price", ""))
+    calibration_block = build_calibration_section(calibration)
 
     return (
         f"Today is {_today()}.\n\n"
-        f"You are validating prediction-market logic constraints for potential mispricing.\n"
-        f"Use official sources and latest confirmed facts.\n\n"
+        f"Research the following prediction-market event and predict the most likely "
+        f"outcome for each market. This event ends very soon.\n\n"
         f"Event: {event_title}\n"
-        f"Event context: {event_desc or '(none)'}\n"
-        f"Scheduled end: {scheduled_end or '(none)'}\n\n"
-        f"Market A (YES outcome):\n"
-        f"- Question: {q_a}\n"
-        f"- Resolution context: {d_a or '(none)'}\n"
-        f"- Current YES price: {p_a}\n\n"
-        f"Market B (YES outcome):\n"
-        f"- Question: {q_b}\n"
-        f"- Resolution context: {d_b or '(none)'}\n"
-        f"- Current YES price: {p_b}\n\n"
-        f"Tasks:\n"
-        f"1) Classify logical relation between YES(A) and YES(B):\n"
-        f"   - equivalent\n"
-        f"   - mutually_exclusive (cannot both be true)\n"
-        f"   - a_implies_b\n"
-        f"   - b_implies_a\n"
-        f"   - unrelated\n"
-        f"2) If relation is mutually_exclusive, set exhaustive=true only if exactly one must be true.\n"
-        f"3) Detect if YES(A) or YES(B) is already impossible now from official facts "
-        f"(e.g., eliminated team, deadline passed, official disqualification).\n"
-        f"4) Give concise evidence with date and URL.\n\n"
+        f"Description: {event_desc or '(none)'}\n"
+        f"Scheduled end: {end_date or '(none)'}\n\n"
+        f"Markets:\n"
+        f"{mq_list}\n\n"
+        f"Search for the latest news, data, standings, polls, expert analysis, "
+        f"and official sources about this event.\n\n"
         f"Rules:\n"
-        f"- Be conservative. If uncertain, choose unrelated and no impossible outcomes.\n"
-        f"- impossible_yes can only include \"a\" and/or \"b\".\n"
-        f"- confidence is 0-100.\n"
-        f"- reason max 25 words.\n\n"
+        f"- READ each market's resolution rules carefully. Pay attention to "
+        f"exact dates, years, thresholds, and what YES vs NO means.\n"
+        f"- For EACH market, predict: will the outcome be YES or NO?\n"
+        f"- Give a probability (0-100) for your prediction being correct.\n"
+        f"- probability > 85 ONLY if you have strong evidence "
+        f"(official results, confirmed data, near-certain outcome).\n"
+        f"- probability 70-85 if evidence is strong but not conclusive.\n"
+        f"- probability < 70 if uncertain. Use outcome \"unknown\" if you truly cannot predict.\n"
+        f"- DO NOT just echo market prices as your prediction. Form an independent opinion.\n"
+        f"- reasoning: MAX 20 words per market.\n"
+        f"- summary: MAX 15 words overall.\n\n"
+        f"{calibration_block}"
         f"Respond with ONLY raw JSON, no markdown fences:\n"
-        f'{{"relation":"equivalent|mutually_exclusive|a_implies_b|b_implies_a|unrelated",'
-        f'"exhaustive":true/false,'
-        f'"impossible_yes":["a|b",...],'
+        f'{{"markets":['
+        f'{{"market":1,"outcome":"yes/no/unknown","probability":0-100,"reasoning":"max 20 words"}},'
+        f'...],'
         f'"confidence":0-100,'
-        f'"reason":"max 25 words",'
-        f'"evidence":[{{"title":"...","date":"YYYY-MM-DD or unknown","url":"https://..."}},...]}}'
+        f'"summary":"max 15 words overall summary"}}'
     )
 
 
-def parse_answer(answer):
-    cleaned = answer
+def _try_parse_json(text):
+    """Try multiple strategies to extract valid JSON from text."""
+    # Strategy 1: direct parse
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: strip markdown fences
+    cleaned = text
     if "```json" in cleaned:
         cleaned = cleaned.split("```json", 1)[1]
     if "```" in cleaned:
         cleaned = cleaned.split("```", 1)[0]
     cleaned = cleaned.strip()
-    raw = json.loads(cleaned)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
 
-    relation = _normalize_relation(raw.get("relation"))
-    exhaustive = bool(raw.get("exhaustive", False))
-    impossible_yes = _normalize_impossible(raw.get("impossible_yes", []))
+    # Strategy 3: find the outermost { ... } with regex
+    match = re.search(r'\{', text)
+    if match:
+        start = match.start()
+        depth = 0
+        end = start
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        candidate = text[start:end]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 4: fix common issues — trailing commas before ] or }
+        fixed = re.sub(r',\s*([}\]])', r'\1', candidate)
+        # Fix single quotes to double quotes (only around keys/values)
+        try:
+            return json.loads(fixed)
+        except json.JSONDecodeError:
+            pass
+
+        # Strategy 5: try to fix truncated JSON by closing open brackets
+        attempt = fixed
+        open_braces = attempt.count('{') - attempt.count('}')
+        open_brackets = attempt.count('[') - attempt.count(']')
+        if open_braces > 0 or open_brackets > 0:
+            # Remove trailing comma if present
+            attempt = attempt.rstrip().rstrip(',')
+            attempt += ']' * open_brackets + '}' * open_braces
+            try:
+                return json.loads(attempt)
+            except json.JSONDecodeError:
+                pass
+
+    # All strategies failed
+    raise json.JSONDecodeError(f"Could not extract JSON from response", text[:200], 0)
+
+
+def _parse_raw(raw):
+    """Convert raw parsed JSON into structured result."""
+    markets = []
+    for m in raw.get("markets", []):
+        market_num = m.get("market", 0)
+        outcome = _safe_str(m.get("outcome", "unknown")).strip().lower()
+        if outcome not in ("yes", "no", "unknown"):
+            outcome = "unknown"
+        prob = m.get("probability", 0)
+        try:
+            prob = int(max(0, min(100, int(prob))))
+        except Exception:
+            prob = 0
+        reasoning = _safe_str(m.get("reasoning", "")).strip()[:200]
+        markets.append({
+            "market": market_num,
+            "outcome": outcome,
+            "probability": prob,
+            "reasoning": reasoning,
+        })
+
     conf = raw.get("confidence", 0)
     try:
         confidence = int(max(0, min(100, int(conf))))
     except Exception:
         confidence = 0
-    reason = _safe_str(raw.get("reason", "")).strip()[:220]
-    evidence = _normalize_evidence(raw.get("evidence", []))
+
+    summary = _safe_str(raw.get("summary", "")).strip()[:200]
 
     return {
-        "relation": relation,
-        "exhaustive": exhaustive,
-        "impossible_yes": impossible_yes,
+        "markets": markets,
         "confidence": confidence,
-        "reason": reason,
-        "evidence": evidence,
+        "summary": summary,
     }
 
 
+def parse_answer(answer):
+    sanitized = sanitize_text(answer)
+    raw = _try_parse_json(sanitized)
+    return _parse_raw(raw)
+
+
+def sanitize_input(input_data):
+    """Deep-sanitize all string values in input to prevent UTF-8 encoding errors."""
+    if isinstance(input_data, dict):
+        return {k: sanitize_input(v) for k, v in input_data.items()}
+    elif isinstance(input_data, list):
+        return [sanitize_input(v) for v in input_data]
+    elif isinstance(input_data, str):
+        return sanitize_text(input_data)
+    return input_data
+
+
 def query(client, input_data):
+    input_data = sanitize_input(input_data)
     prompt = build_prompt(input_data)
     conv = client.create_conversation()
     conv.ask(prompt)
@@ -261,7 +341,7 @@ def query(client, input_data):
 
 def server_mode(session_token):
     client = Perplexity(session_token=session_token)
-    log("INFO", "Constraint bridge ready")
+    log("INFO", "Prediction bridge ready")
 
     cooldown_base = max(1, int(os.environ.get("CONSTRAINT_RATE_LIMIT_COOLDOWN_SEC", "30")))
     cooldown_max = max(cooldown_base, int(os.environ.get("CONSTRAINT_RATE_LIMIT_MAX_COOLDOWN_SEC", "300")))
@@ -363,4 +443,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
