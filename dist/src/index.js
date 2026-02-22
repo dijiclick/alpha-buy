@@ -30,9 +30,9 @@ async function main() {
     else {
         log.info(`Backfill already complete. ${state.knownEventIds.size} events, ${state.knownMarketIds.size} markets in memory`);
     }
-    // Phase 2: Start polling loops
-    startEventSyncer(state);
-    // Phase 3: Start resolution agent
+    // Phase 2: Start polling loops (await first full sync to clean stale events)
+    await startEventSyncer(state);
+    // Phase 3: Start resolution agent (DB now has fresh closed flags)
     startResolutionAgent(state);
     // Phase 3b: Start real-time price stream (WebSocket)
     startPriceStream(state);

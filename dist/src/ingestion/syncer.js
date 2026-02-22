@@ -4,7 +4,7 @@ import { normalize } from '../util/normalize.js';
 import { upsertEventsBatch, upsertMarketsBatch, closeStaleEvents } from '../db/supabase.js';
 const log = createLogger('syncer');
 
-export function startEventSyncer(state) {
+export async function startEventSyncer(state) {
     log.info(`Event syncer started (full every ${config.SYNC_INTERVAL / 1000}s, quick every ${config.QUICK_SYNC_INTERVAL / 1000}s)`);
 
     // Full sync: paginate ALL events, close stale ones
@@ -27,8 +27,8 @@ export function startEventSyncer(state) {
         }
     };
 
-    // Run full immediately, then on interval
-    runFull();
+    // Await first full sync so DB has fresh closed flags before agent starts
+    await runFull();
     setInterval(runFull, config.SYNC_INTERVAL);
     // Quick sync every 5 min (offset by 30s to avoid collision with full)
     setTimeout(() => setInterval(runQuick, config.QUICK_SYNC_INTERVAL), 30_000);

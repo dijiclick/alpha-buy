@@ -329,9 +329,9 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
 
     // Pre-flight: skip if already closed on Polymarket (saves expensive Perplexity query)
     const firstMarket = event.markets?.[0];
-    if (firstMarket?.condition_id) {
+    if (firstMarket?.polymarket_market_id) {
         try {
-            const gmRes = await fetch(`${config.GAMMA_BASE}/markets/${firstMarket.condition_id}`);
+            const gmRes = await fetch(`${config.GAMMA_BASE}/markets/${firstMarket.polymarket_market_id}`);
             if (gmRes.ok) {
                 const live = await gmRes.json();
                 if (live.closed) {
@@ -339,8 +339,14 @@ async function processEvent(event, tracked, slotIndex, state, counters) {
                     state.resolvedEventIds.set(eventId, Date.now());
                     return;
                 }
+            } else {
+                log.warn(`Gamma API ${gmRes.status} for "${event.title.slice(0, 60)}", skipping to be safe`);
+                return;
             }
-        } catch {}
+        } catch (e) {
+            log.warn(`Gamma pre-flight failed for "${event.title.slice(0, 60)}": ${e.message}, skipping`);
+            return;
+        }
     }
 
     const result = await checkEventWithPerplexity(event, slotIndex);
@@ -612,8 +618,8 @@ async function fetchPrices(market) {
             }
         }
 
-        if (market.condition_id) {
-            const res = await fetch(`${config.GAMMA_BASE}/markets/${market.condition_id}`);
+        if (market.polymarket_market_id) {
+            const res = await fetch(`${config.GAMMA_BASE}/markets/${market.polymarket_market_id}`);
             if (res.ok) {
                 const gm = await res.json();
                 const op = typeof gm.outcomePrices === 'string' ? JSON.parse(gm.outcomePrices) : gm.outcomePrices;
@@ -661,6 +667,20 @@ function shortQuestion(q, eventTitle) {
 
 async function sendTelegramAlert(event, market, result, prices, profitPct) {
     if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) return;
+
+    // Final guard: verify market is still open on Polymarket
+    if (market.polymarket_market_id) {
+        try {
+            const gmRes = await fetch(`${config.GAMMA_BASE}/markets/${market.polymarket_market_id}`);
+            if (gmRes.ok) {
+                const live = await gmRes.json();
+                if (live.closed) {
+                    log.info(`ALERT BLOCKED (closed on PM): "${event.title.slice(0, 60)}"`);
+                    return;
+                }
+            }
+        } catch {} // non-blocking — pre-flight already handled strict check
+    }
 
     const eventUrl = `https://polymarket.com/event/${event.slug || ''}`;
     const marketUrl = `https://polymarket.com/event/${event.slug || ''}/${market.slug || ''}`;
