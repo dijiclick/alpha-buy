@@ -215,6 +215,19 @@ export async function checkAndProcessEvent(event, state) {
 
 const _counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
+function sanitizeDate(iso) {
+    if (!iso) return null;
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) {
+        // Try fixing common Perplexity errors like Feb 29 in non-leap years
+        const fixed = iso.replace(/02-29/, '02-28');
+        const d2 = new Date(fixed);
+        if (!isNaN(d2.getTime())) return fixed;
+        return null;
+    }
+    return iso;
+}
+
 function toFiniteNumber(value) {
     const n = Number(value);
     return Number.isFinite(n) ? n : null;
@@ -777,13 +790,18 @@ async function checkEventWithPerplexity(event, slotIndex) {
     }
 
     try {
+        // Cap markets to avoid HTTP 414 (URI Too Long) on events with many sub-markets
+        const MAX_MARKETS = 15;
+        const markets = event.markets.length > MAX_MARKETS
+            ? event.markets.slice(0, MAX_MARKETS)
+            : event.markets;
         const input = {
             mode: 'event',
             event_title: event.title,
-            event_description: event.description || '',
+            event_description: (event.description || '').slice(0, 500),
             end_date: event.end_date || '',
-            market_questions: event.markets.map(m => m.question),
-            market_descriptions: event.markets.map(m => m.description || ''),
+            market_questions: markets.map(m => m.question),
+            market_descriptions: markets.map(m => (m.description || '').slice(0, 200)),
         };
 
         const line = await bridge.query(input);
@@ -812,9 +830,9 @@ async function checkEventWithPerplexity(event, slotIndex) {
             winningMarketIndex: winner ? winner.index : null,
             marketOutcomes,
             confidence: Number(parsed.confidence) || 0,
-            estimatedEnd: parsed.estimated_end || null,
-            estimatedEndMin: parsed.estimated_end_min || parsed.estimated_end || null,
-            estimatedEndMax: parsed.estimated_end_max || parsed.estimated_end || null,
+            estimatedEnd: sanitizeDate(parsed.estimated_end),
+            estimatedEndMin: sanitizeDate(parsed.estimated_end_min || parsed.estimated_end),
+            estimatedEndMax: sanitizeDate(parsed.estimated_end_max || parsed.estimated_end),
             reasoning: parsed.reasoning || '',
             source: 'perplexity',
         };

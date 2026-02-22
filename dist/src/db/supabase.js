@@ -192,11 +192,12 @@ export async function getAllOpenEvents() {
     const db = getDb();
     const events = [];
     let from = 0;
-    const pageSize = 1000;
+    const pageSize = 500;
+    const marketCols = 'id,polymarket_market_id,question,description,slug,outcomes,outcome_prices,clob_token_ids,best_ask,last_trade_price,closed,end_date';
     while (true) {
         const { data, error } = await db
             .from('events')
-            .select('*, markets(*)')
+            .select(`id,polymarket_event_id,title,description,slug,end_date,closed,markets(${marketCols})`)
             .eq('closed', false)
             .range(from, from + pageSize - 1);
         if (error) {
