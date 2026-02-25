@@ -167,7 +167,7 @@ async function triggerCheck(tokenId, state, reason) {
         const event = events[0];
         if (!event || !event.markets || event.markets.length === 0) return;
 
-        log.info(`WS TRIGGER [${reason}]: "${event.title.slice(0, 60)}" — checking with Perplexity`);
+        log.info(`WS TRIGGER [${reason}]: "${event.title.slice(0, 60)}" — checking with LLM`);
         await checkAndProcessEvent(event, state);
     } catch (e) {
         log.warn(`WS trigger check failed: ${e.message}`);
