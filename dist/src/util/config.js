@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 function env(key) {
     const v = process.env[key];
     if (!v)
@@ -8,15 +10,30 @@ function env(key) {
 function optEnv(key) {
     return process.env[key] || undefined;
 }
+function getPerplexityTokens() {
+    const tokens = [];
+    const primary = process.env.PERPLEXITY_SESSION_TOKEN;
+    if (!primary) throw new Error('Missing env: PERPLEXITY_SESSION_TOKEN');
+    tokens.push(primary);
+    for (let i = 2; i <= 10; i++) {
+        const t = process.env[`PERPLEXITY_SESSION_TOKEN_${i}`];
+        if (t) tokens.push(t);
+    }
+    return tokens;
+}
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const PROJECT_ROOT = join(__dirname, '..', '..', '..');
 export const config = {
     // Supabase
     SUPABASE_URL: env('SUPABASE_URL'),
     SUPABASE_KEY: env('SUPABASE_SERVICE_KEY'),
-    // OpenRouter (DeepSeek with web search)
-    OPENROUTER_API_KEY: env('OPENROUTER_API_KEY'),
-    OPENROUTER_MODEL: optEnv('OPENROUTER_MODEL') || 'deepseek/deepseek-chat-v3-0324:online',
-    OPENROUTER_CONCURRENCY: Number(optEnv('OPENROUTER_CONCURRENCY') || '5'),
-    OPENROUTER_TIMEOUT_MS: Number(optEnv('OPENROUTER_TIMEOUT_MS') || '60000'),
+    // Perplexity (multiple tokens = concurrent bridges)
+    PERPLEXITY_SESSION_TOKENS: getPerplexityTokens(),
+    // Python bridge
+    PYTHON_CMD: optEnv('PYTHON_CMD') || 'uv',
+    PERPLEXITY_BRIDGE_PATH: optEnv('PERPLEXITY_BRIDGE_PATH')
+        || join(PROJECT_ROOT, 'scripts', 'perplexity_bridge.py'),
     // Telegram
     TELEGRAM_BOT_TOKEN: optEnv('TELEGRAM_BOT_TOKEN'),
     TELEGRAM_CHAT_ID: optEnv('TELEGRAM_CHAT_ID'),

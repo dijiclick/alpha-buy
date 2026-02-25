@@ -88,7 +88,7 @@ async function main() {
     console.log(`  ${oldEvents.length} events found`);
 
     const eventsToInsert = oldEvents.map(e => {
-        const { id, ...rest } = e; // strip auto-generated id
+        const { id, last_checked_at, ...rest } = e; // strip auto-generated id + extra columns
         return rest;
     });
 
@@ -142,7 +142,7 @@ async function main() {
     console.log(`  ${oldOutcomes.length} outcomes found`);
 
     const outcomesToInsert = oldOutcomes.map(o => {
-        const { id, ...rest } = o;
+        const { id, estimated_end, ...rest } = o; // strip id + extra columns
         rest.market_id = marketIdMap.get(o.market_id) || null;
         return rest;
     }).filter(o => o.market_id !== null); // skip orphans

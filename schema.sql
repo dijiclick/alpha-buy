@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS events (
   closed boolean DEFAULT false,
   markets_count int DEFAULT 0,
   total_volume numeric DEFAULT 0,
-  updated_at timestamptz DEFAULT now()
+  updated_at timestamptz DEFAULT now(),
+  last_checked_at timestamptz
 );
 
 -- Markets table

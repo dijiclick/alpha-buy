@@ -1,6 +1,3 @@
-# DEPRECATED: This bridge is no longer used. The system now calls OpenRouter API
-# (DeepSeek with web search) directly from JS. Kept for reference/rollback.
-#
 # /// script
 # requires-python = ">=3.10"
 # dependencies = ["perplexity-webui-scraper"]

@@ -1,12 +1,12 @@
+import { spawn } from 'child_process';
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
 import { getAllOpenEvents, getEventsByPolymarketIds, upsertOutcome, updateEventLastChecked } from '../db/supabase.js';
 const log = createLogger('agent');
 
-// ─── OpenRouter API (DeepSeek with web search) ───
+// ─── Bridge pool (one process per session token) ───
 
-let _activeCalls = 0;
-
+const _bridges = [];
 const DEFAULT_HOT_LOOP_INTERVAL_MS = 60_000;
 const DEFAULT_HOT_LOOKBACK_MS = 20 * 60_000;
 const DEFAULT_INITIAL_POST_END_DELAY_MS = 75_000;
@@ -23,141 +23,129 @@ const INITIAL_POST_END_DELAY_MS = Math.min(
     Math.max(60_000, readMsEnv('INITIAL_POST_END_DELAY_MS', DEFAULT_INITIAL_POST_END_DELAY_MS))
 );
 
-function _today() {
-    return new Date().toISOString().split('T')[0];
-}
+function spawnBridge(token, index) {
+    log.info(`Spawning bridge #${index}...`);
 
-function buildEventPrompt(input) {
-    const title = input.event_title || '';
-    const desc = input.event_description || '';
-    const endDate = input.end_date || '';
-    const questions = input.market_questions || [];
-    const descriptions = input.market_descriptions || [];
+    // uv uses `uv run --script bridge.py --server`, others use `python3 bridge.py --server`
+    const args = config.PYTHON_CMD === 'uv'
+        ? ['run', '--script', config.PERPLEXITY_BRIDGE_PATH, '--server']
+        : [config.PERPLEXITY_BRIDGE_PATH, '--server'];
 
-    const mqLines = [];
-    for (let i = 0; i < questions.length; i++) {
-        mqLines.push(`  ${i + 1}. ${questions[i]}`);
-        if (i < descriptions.length && descriptions[i]) {
-            mqLines.push(`     Resolution rules: ${descriptions[i].slice(0, 500)}`);
+    const child = spawn(config.PYTHON_CMD,
+        args,
+        {
+            env: { ...process.env, PERPLEXITY_SESSION_TOKEN: token },
+            stdio: ['pipe', 'pipe', 'pipe'],
         }
-    }
-    const mqList = mqLines.join('\n');
-
-    return (
-        `Today is ${_today()}.\n\n` +
-        `I need to determine the status of a prediction-market event and ` +
-        `each of its individual markets.\n\n` +
-        `Event: ${title}\n` +
-        `Description: ${desc || '(none)'}\n` +
-        `Scheduled end: ${endDate || '(none)'}\n\n` +
-        `Markets:\n` +
-        `${mqList}\n\n` +
-        `Search for the latest news about this event.\n\n` +
-        `Rules:\n` +
-        `- READ each market's resolution rules carefully. Pay attention to ` +
-        `exact dates, years, and what YES vs NO means for each market.\n` +
-        `- resolved=true ONLY if the outcome is officially confirmed ` +
-        `(final score, winner declared, bill signed, official announcement). ` +
-        `Predictions, polls, and forecasts do NOT count.\n` +
-        `- For EACH market, give outcome: "yes", "no", or "unknown".\n` +
-        `- If not resolved, find the EXACT time the outcome will be known ` +
-        `(game end, vote result, announcement, deadline).\n` +
-        `  - estimated_end: EXACT datetime if known, else null\n` +
-        `  - If exact time is unknown, give a range:\n` +
-        `    - estimated_end_min: EARLIEST possible\n` +
-        `    - estimated_end_max: LATEST possible\n` +
-        `  - ALL datetimes must be UTC with seconds: YYYY-MM-DDTHH:MM:SSZ\n` +
-        `  - E.g. NBA game tips off 8pm ET → min=2026-02-21T03:00:00Z, max=2026-02-21T04:30:00Z\n` +
-        `  - E.g. bill vote Feb 25 2pm ET → exact=2026-02-25T19:00:00Z\n` +
-        `  - E.g. deadline end of March → exact=null, min/max=2026-03-31T23:59:59Z\n\n` +
-        `CRITICAL formatting rules:\n` +
-        `- answer: MAX 10 words. E.g. "Team A won 3-1" or ` +
-        `"Match starts Feb 22 at 8pm EST" or "No result yet, game tomorrow"\n` +
-        `- reasoning: MAX 15 words. E.g. "Official score confirmed on ESPN" ` +
-        `or "Match scheduled for tomorrow per Liquipedia"\n\n` +
-        `Respond with ONLY raw JSON, no markdown fences:\n` +
-        `{"resolved":true/false,` +
-        `"answer":"max 10 words",` +
-        `"markets":[` +
-        `{"market":1,"outcome":"yes/no/unknown","confidence":0-100},` +
-        `...],` +
-        `"confidence":0-100,` +
-        `"estimated_end":"YYYY-MM-DDTHH:MM:SSZ or null",` +
-        `"estimated_end_min":"YYYY-MM-DDTHH:MM:SSZ or null",` +
-        `"estimated_end_max":"YYYY-MM-DDTHH:MM:SSZ or null",` +
-        `"reasoning":"max 15 words"}`
     );
+
+    let buffer = '';
+    const waiters = [];
+
+    child.stdout.on('data', (chunk) => {
+        buffer += chunk.toString();
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+            if (!line.trim()) continue;
+            const entry = waiters.shift();
+            if (entry) {
+                entry.resolve(line);
+            }
+        }
+    });
+
+    child.stderr.on('data', d => {
+        const msg = d.toString().trim();
+        if (!msg) return;
+        if (/RATE_LIMITED|SESSION_ERR|ERROR|FAILED/i.test(msg)) {
+            log.warn(`Bridge#${index}: ${msg.slice(0, 500)}`);
+        }
+        // Skip verbose REQ/OK/STATS lines from bridge stderr
+    });
+
+    const b = {
+        child,
+        dead: false,
+        index,
+
+        query(input) {
+            return new Promise((resolve, reject) => {
+                if (this.dead) return reject(new Error(`Bridge#${index} is dead`));
+
+                const entry = { done: false };
+
+                entry.timer = setTimeout(() => {
+                    if (entry.done) return;
+                    entry.done = true;
+                    const idx = waiters.indexOf(entry);
+                    if (idx !== -1) waiters.splice(idx, 1);
+                    reject(new Error(`Bridge#${index} timeout (90s)`));
+                }, 90_000);
+
+                entry.resolve = (line) => {
+                    if (entry.done) return;
+                    entry.done = true;
+                    clearTimeout(entry.timer);
+                    resolve(line);
+                };
+
+                entry.reject = (err) => {
+                    if (entry.done) return;
+                    entry.done = true;
+                    clearTimeout(entry.timer);
+                    reject(err);
+                };
+
+                waiters.push(entry);
+                child.stdin.write(JSON.stringify(input) + '\n');
+            });
+        },
+
+        kill() {
+            this.dead = true;
+            child.kill();
+        }
+    };
+
+    child.on('close', (code) => {
+        log.warn(`Bridge#${index} exited (code ${code})`);
+        b.dead = true;
+        while (waiters.length) {
+            const entry = waiters.shift();
+            if (!entry.done) {
+                entry.done = true;
+                clearTimeout(entry.timer);
+                entry.reject(new Error(`Bridge#${index} died (code ${code})`));
+            }
+        }
+    });
+
+    child.on('error', (e) => {
+        log.warn(`Bridge#${index} spawn error: ${e.message}`);
+        b.dead = true;
+    });
+
+    return b;
 }
 
-function parseJsonResponse(text) {
-    let cleaned = text;
-    if (cleaned.includes('```json')) {
-        cleaned = cleaned.split('```json')[1];
-    }
-    if (cleaned.includes('```')) {
-        cleaned = cleaned.split('```')[0];
-    }
-    cleaned = cleaned.trim();
-    return JSON.parse(cleaned);
-}
+function getBridge(slotIndex) {
+    const slot = _bridges[slotIndex];
+    if (slot && slot.bridge && !slot.bridge.dead) return slot.bridge;
 
-async function queryOpenRouter(prompt) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), config.OPENROUTER_TIMEOUT_MS);
+    const token = config.PERPLEXITY_SESSION_TOKENS[slotIndex];
+    if (!token) return null;
 
-    try {
-        const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${config.OPENROUTER_API_KEY}`,
-            },
-            body: JSON.stringify({
-                model: config.OPENROUTER_MODEL,
-                messages: [
-                    {
-                        role: 'system',
-                        content: 'You are a prediction market resolution analyst. Always respond with raw JSON only, no markdown fences or explanatory text.',
-                    },
-                    {
-                        role: 'user',
-                        content: prompt,
-                    },
-                ],
-                temperature: 0.1,
-                max_tokens: 1024,
-            }),
-            signal: controller.signal,
-        });
-
-        if (res.status === 429) {
-            const retryAfter = Number(res.headers.get('retry-after')) || 5;
-            log.warn(`OpenRouter rate limited, retrying in ${retryAfter}s...`);
-            clearTimeout(timeoutId);
-            await new Promise(r => setTimeout(r, retryAfter * 1000));
-            return queryOpenRouter(prompt);
-        }
-
-        if (!res.ok) {
-            const body = await res.text().catch(() => '');
-            throw new Error(`OpenRouter ${res.status}: ${body.slice(0, 300)}`);
-        }
-
-        const data = await res.json();
-        const content = data.choices?.[0]?.message?.content;
-        if (!content) throw new Error('Empty response from OpenRouter');
-
-        return parseJsonResponse(content);
-    } finally {
-        clearTimeout(timeoutId);
-    }
+    const bridge = spawnBridge(token, slotIndex);
+    _bridges[slotIndex] = { bridge, token, index: slotIndex };
+    return bridge;
 }
 
 // ─── Public entry points ───
 
 export function startResolutionAgent(state) {
-    const concurrency = config.OPENROUTER_CONCURRENCY;
-    log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s, hot=${HOT_LOOP_INTERVAL_MS / 1000}s, first_post_end_delay=${INITIAL_POST_END_DELAY_MS / 1000}s, ${concurrency} workers)`);
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
+    log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s, hot=${HOT_LOOP_INTERVAL_MS / 1000}s, first_post_end_delay=${INITIAL_POST_END_DELAY_MS / 1000}s, ${concurrency} bridges)`);
 
     // Full discovery scan (hourly)
     let cycleRunning = false;
@@ -196,7 +184,7 @@ export function startResolutionAgent(state) {
     setTimeout(hot, Math.min(30_000, HOT_LOOP_INTERVAL_MS));
     setInterval(hot, HOT_LOOP_INTERVAL_MS);
 
-    // Discovery scan: find events entering 24h horizon without LLM queries
+    // Discovery scan: find events entering 24h horizon without Perplexity queries
     const DISCOVERY_INTERVAL = 15 * 60_000;
     const discover = async () => {
         try { await runDiscoveryScan(state); }
@@ -205,18 +193,6 @@ export function startResolutionAgent(state) {
     setTimeout(discover, 60_000); // first run after 1 min
     setInterval(discover, DISCOVERY_INTERVAL);
 
-    // Idle scan: pre-check end times for unchecked events beyond 24h
-    const IDLE_INTERVAL = 10 * 60_000;
-    let idleRunning = false;
-    const idle = async () => {
-        if (idleRunning || cycleRunning) return; // only run when workers are free
-        idleRunning = true;
-        try { await runIdleScan(state); }
-        catch (e) { log.error('Idle scan failed', e.message); }
-        finally { idleRunning = false; }
-    };
-    setTimeout(idle, 5 * 60_000); // first run after 5 min
-    setInterval(idle, IDLE_INTERVAL);
 }
 
 // Exported so websocket.js can trigger immediate checks
@@ -231,7 +207,7 @@ function sanitizeDate(iso) {
     if (!iso) return null;
     const d = new Date(iso);
     if (isNaN(d.getTime())) {
-        // Try fixing common LLM errors like Feb 29 in non-leap years
+        // Try fixing common Perplexity errors like Feb 29 in non-leap years
         const fixed = iso.replace(/02-29/, '02-28');
         const d2 = new Date(fixed);
         if (!isNaN(d2.getTime())) return fixed;
@@ -285,12 +261,14 @@ function getYesPrice(market) {
 function eventHasHotPrice(event, threshold) {
     return (event.markets || []).some(m => {
         const price = getYesPrice(m);
-        return price !== null && price >= threshold;
+        if (price === null || price <= 0 || price >= 1) return false; // settled
+        // YES side hot (price >= threshold) OR NO side hot (price <= 1 - threshold)
+        return price >= threshold || price <= (1 - threshold);
     });
 }
 
 async function runAgentCycle(state) {
-    const concurrency = config.OPENROUTER_CONCURRENCY;
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
 
     // Get all open events, then apply price-first gate for untracked events.
     const events = await getAllOpenEvents();
@@ -354,7 +332,7 @@ async function runAgentCycle(state) {
         return aEnd - bEnd;
     });
 
-    // Batch Gamma pre-flight: check all markets in parallel before using LLM
+    // Batch Gamma pre-flight: check all markets in parallel before using Perplexity
     const gammaResults = new Map();
     const GAMMA_BATCH = 20;
     for (let i = 0; i < queue.length; i += GAMMA_BATCH) {
@@ -395,7 +373,7 @@ async function runAgentCycle(state) {
     queue.length = 0;
     queue.push(...filteredQueue);
 
-    log.info(`Agent: ${queue.length} to check (${gammaFiltered} pre-filtered closed), ${skippedResolved} resolved, ${skippedFuture} future, ${skippedBelowPrice} below price, ${concurrency} workers`);
+    log.info(`Agent: ${queue.length} to check (${gammaFiltered} pre-filtered closed), ${skippedResolved} resolved, ${skippedFuture} future, ${skippedBelowPrice} below price, ${concurrency} bridges`);
 
     const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
 
@@ -428,10 +406,10 @@ async function runAgentCycle(state) {
 }
 
 // ─── Hot loop: events ending NOW (every 2 min) ───
-// Uses LLM estimatedEndMin (precise) instead of Polymarket's end_date (imprecise)
+// Uses Perplexity's estimatedEndMin (precise) instead of Polymarket's end_date (imprecise)
 
 async function runHotLoop(state) {
-    const concurrency = config.OPENROUTER_CONCURRENCY;
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
     const now = Date.now();
 
     // Scan tracked events for those whose estimatedEndMin has passed and are due by nextCheckAt.
@@ -506,7 +484,7 @@ async function runHotLoop(state) {
     }
 }
 
-// ─── Discovery scan: lightweight tracking without LLM ───
+// ─── Discovery scan: lightweight tracking without Perplexity ───
 
 async function runDiscoveryScan(state) {
     const events = await getAllOpenEvents();
@@ -543,7 +521,7 @@ async function runDiscoveryScan(state) {
 
     log.info(`Discovery: ${newEvents.length} new events entering 24h horizon (${state.trackedEvents.size} total tracked)`);
 
-    // Immediately check newly discovered events with LLM
+    // Immediately check newly discovered events with Perplexity
     // Sort soonest-ending first
     newEvents.sort((a, b) => {
         const aEnd = new Date(a.end_date).getTime();
@@ -551,13 +529,13 @@ async function runDiscoveryScan(state) {
         return aEnd - bEnd;
     });
 
-    const concurrency = config.OPENROUTER_CONCURRENCY;
+    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
     const reserveSlotForWS = concurrency >= 2;
     const workerStart = reserveSlotForWS ? 1 : 0;
     const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
 
     if (workerCount <= 0) {
-        log.warn('Discovery: no worker slots available (all reserved for WS)');
+        log.warn('Discovery: no bridge slots available (all reserved for WS)');
         return;
     }
 
@@ -589,103 +567,12 @@ async function runDiscoveryScan(state) {
     }
 }
 
-// ─── Idle scan: pre-check end times for events beyond 24h ───
-
-async function runIdleScan(state) {
-    const events = await getAllOpenEvents();
-    const now = Date.now();
-    const horizon = config.END_DATE_HORIZON;
-    const candidates = [];
-
-    for (const event of events) {
-        if (event.closed || !event.markets?.length) continue;
-        const eventId = event.polymarket_event_id;
-        if (state.resolvedEventIds.has(eventId)) continue;
-
-        // Skip events already checked by LLM
-        const tracked = state.trackedEvents.get(eventId);
-        if (tracked && tracked.checkCount > 0) continue;
-
-        if (!event.end_date) continue;
-        const endTime = new Date(event.end_date).getTime();
-        if (isNaN(endTime) || endTime <= now) continue;
-
-        // Only events BEYOND the 24h horizon (within-horizon handled by discovery scan)
-        if (endTime - now <= horizon) continue;
-
-        candidates.push({ event, endTime });
-    }
-
-    if (candidates.length === 0) return;
-
-    // Sort soonest-ending first (closest to entering the 24h window)
-    candidates.sort((a, b) => a.endTime - b.endTime);
-
-    // With 4 workers @ ~10s/query, 50 events ≈ 2 min of work
-    const MAX_IDLE_BATCH = 50;
-    const batch = candidates.slice(0, MAX_IDLE_BATCH);
-
-    log.info(`Idle: checking ${batch.length} unchecked events for end times (${candidates.length} total unchecked)`);
-
-    const concurrency = config.OPENROUTER_CONCURRENCY;
-    const reserveSlotForWS = concurrency >= 2;
-    const workerStart = reserveSlotForWS ? 1 : 0;
-    const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
-
-    if (workerCount <= 0) return;
-
-    // Add to tracking so processEvent can handle them
-    for (const { event } of batch) {
-        const eventId = event.polymarket_event_id;
-        if (!state.trackedEvents.has(eventId)) {
-            state.trackedEvents.set(eventId, {
-                eventId,
-                title: event.title,
-                marketCount: event.markets.length,
-                estimatedEndMin: event.end_date,
-                estimatedEndMax: null,
-                lastChecked: 0,
-                checkCount: 0,
-                postEndCheckCount: 0,
-                nextCheckAt: calculateNextCheck(event.end_date, 0),
-            });
-        }
-    }
-
-    const queue = batch.map(({ event }) => ({
-        event,
-        tracked: state.trackedEvents.get(event.polymarket_event_id),
-    }));
-
-    const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
-
-    async function worker(slotIndex) {
-        while (queue.length > 0) {
-            const item = queue.shift();
-            if (!item) break;
-            try {
-                await processEvent(item.event, item.tracked, slotIndex, state, counters);
-            } catch (e) {
-                log.error(`Idle#${slotIndex} error: ${e.message}`);
-            }
-        }
-    }
-
-    await Promise.all(
-        Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
-    );
-
-    if (counters.rechecked > 0 || counters.resolved > 0) {
-        log.info(`Idle: ${counters.rechecked} end times checked, ${counters.resolved} already resolved`);
-    }
-}
-
 // ─── Event processing ───
 
 async function processEvent(event, tracked, slotIndex, state, counters, { skipGammaPreflight = false } = {}) {
     const eventId = event.polymarket_event_id;
 
-    // Pre-flight: skip if already closed on Polymarket (saves expensive LLM query)
+    // Pre-flight: skip if already closed on Polymarket (saves expensive Perplexity query)
     // Skipped when agent cycle already batch-checked Gamma upfront
     if (!skipGammaPreflight) {
         const firstMarket = event.markets?.[0];
@@ -792,29 +679,23 @@ function calculateNextCheck(estimatedEndISO, postEndCheckCount = 0) {
     return now + POST_INTERVALS[idx];
 }
 
-// ─── OpenRouter LLM check ───
+// ─── Perplexity bridge ───
 
 async function checkEventWithPerplexity(event, slotIndex) {
-    // Concurrency guard
-    if (_activeCalls >= config.OPENROUTER_CONCURRENCY) {
-        await new Promise(resolve => {
-            const check = setInterval(() => {
-                if (_activeCalls < config.OPENROUTER_CONCURRENCY) {
-                    clearInterval(check);
-                    resolve();
-                }
-            }, 500);
-        });
+    const bridge = getBridge(slotIndex);
+    if (!bridge) {
+        log.warn(`No bridge available for slot ${slotIndex}`);
+        return null;
     }
 
-    _activeCalls++;
     try {
+        // Cap markets to avoid HTTP 414 (URI Too Long) on events with many sub-markets
         const MAX_MARKETS = 15;
         const markets = event.markets.length > MAX_MARKETS
             ? event.markets.slice(0, MAX_MARKETS)
             : event.markets;
-
         const input = {
+            mode: 'event',
             event_title: event.title,
             event_description: (event.description || '').slice(0, 500),
             end_date: event.end_date || '',
@@ -822,11 +703,11 @@ async function checkEventWithPerplexity(event, slotIndex) {
             market_descriptions: markets.map(m => (m.description || '').slice(0, 200)),
         };
 
-        const prompt = buildEventPrompt(input);
-        const parsed = await queryOpenRouter(prompt);
+        const line = await bridge.query(input);
+        const parsed = JSON.parse(line);
 
         if (parsed.error) {
-            log.warn(`OpenRouter error (worker#${slotIndex}): ${parsed.error}`);
+            log.warn(`Perplexity error (bridge#${slotIndex}): ${parsed.error}`);
             return null;
         }
 
@@ -838,29 +719,22 @@ async function checkEventWithPerplexity(event, slotIndex) {
             }))
             : [];
 
-        const winner = marketOutcomes
-            .filter(m => m.outcome === 'yes')
-            .sort((a, b) => b.confidence - a.confidence)[0] || null;
-
         return {
             resolved: parsed.resolved === true,
             answer: parsed.answer || 'unknown',
-            winningMarketIndex: winner ? winner.index : null,
             marketOutcomes,
             confidence: Number(parsed.confidence) || 0,
             estimatedEnd: sanitizeDate(parsed.estimated_end),
             estimatedEndMin: sanitizeDate(parsed.estimated_end_min || parsed.estimated_end),
             estimatedEndMax: sanitizeDate(parsed.estimated_end_max || parsed.estimated_end),
             reasoning: parsed.reasoning || '',
-            source: 'deepseek',
+            source: 'perplexity',
         };
     }
     catch (e) {
-        log.warn(`OpenRouter check failed (worker#${slotIndex}) for "${event.title.slice(0, 60)}"`, e.message);
+        log.warn(`Perplexity check failed (bridge#${slotIndex}) for "${event.title.slice(0, 60)}"`, e.message);
+        if (_bridges[slotIndex]?.bridge?.dead) _bridges[slotIndex] = null;
         return null;
-    }
-    finally {
-        _activeCalls--;
     }
 }
 
@@ -877,12 +751,13 @@ async function writeEventResults(event, result) {
         }
     }
 
-    let winnerIdx = result.winningMarketIndex;
+    // Find the best mispricing opportunity across all markets (YES or NO)
     let alertMarket = null;
+    let bestProfit = -Infinity;
 
     for (let i = 0; i < markets.length; i++) {
         const mo = outcomeMap.get(i);
-        const outcome = mo ? mo.outcome : (i === winnerIdx ? 'yes' : 'no');
+        const outcome = mo ? mo.outcome : 'unknown';
         const conf = mo ? mo.confidence : result.confidence;
 
         await writeResult(markets[i], {
@@ -892,48 +767,82 @@ async function writeEventResults(event, result) {
             resolved: result.resolved,
         });
 
-        if (outcome === 'yes' && !alertMarket) {
-            alertMarket = { market: markets[i], confidence: conf };
+        // Skip unknown outcomes — no actionable signal
+        if (outcome === 'unknown' || conf < config.MIN_CONFIDENCE) continue;
+
+        // Calculate mispricing profit for this market
+        const yesPrice = getYesPrice(markets[i]);
+        if (yesPrice === null) continue;
+
+        let profit, side;
+        if (outcome === 'yes') {
+            // Real outcome is YES → buy YES token (currently at yesPrice)
+            if (yesPrice <= 0 || yesPrice >= 1) continue; // settled, no opportunity
+            profit = (1.0 - yesPrice) / yesPrice;
+            side = 'yes';
+        } else {
+            // Real outcome is NO → buy NO token (currently at 1 - yesPrice)
+            const noPrice = 1.0 - yesPrice;
+            if (noPrice <= 0 || noPrice >= 1) continue; // settled, no opportunity
+            profit = (1.0 - noPrice) / noPrice;
+            side = 'no';
+        }
+
+        if (profit > bestProfit) {
+            bestProfit = profit;
+            alertMarket = { market: markets[i], confidence: conf, side, outcome };
         }
     }
 
-    if (alertMarket) {
-        log.info(`MAPPED: "${event.title.slice(0, 60)}" → "${alertMarket.market.question.slice(0, 60)}" = YES (${alertMarket.confidence}%)`);
+    if (!alertMarket) {
+        log.info(`NO OPPORTUNITY: "${event.title.slice(0, 60)}" — no confident outcome`);
+        return;
+    }
 
-        // Always try real prices first (for profit calc), fall back to implied for resolved
-        const realPrices = await fetchPrices(alertMarket.market);
-        const prices = realPrices || (result.resolved ? { type: 'resolved', yes: '1.00', no: '0.00' } : null);
+    const side = alertMarket.side;
+    log.info(`MAPPED: "${event.title.slice(0, 60)}" → "${alertMarket.market.question.slice(0, 60)}" = ${alertMarket.outcome.toUpperCase()} → buy ${side.toUpperCase()} (${alertMarket.confidence}%)`);
 
-        // Calculate profit % for resolved events with live prices
-        let profitPct = null;
-        if (result.resolved && prices && prices.type !== 'resolved') {
-            const buyPrice = prices.type === 'book'
+    // Fetch real prices
+    const realPrices = await fetchPrices(alertMarket.market);
+    const prices = realPrices || (result.resolved ? { type: 'resolved', yes: '1.00', no: '0.00' } : null);
+
+    // Calculate profit % for resolved events with live prices
+    let profitPct = null;
+    if (result.resolved && prices && prices.type !== 'resolved') {
+        let buyPrice;
+        if (side === 'yes') {
+            buyPrice = prices.type === 'book'
                 ? parseFloat(prices.yesAsk)
                 : parseFloat(prices.yes);
-            if (!isNaN(buyPrice) && buyPrice > 0 && buyPrice < 1) {
-                profitPct = ((1.00 - buyPrice) / buyPrice) * 100;
-            }
-        }
-
-        // Store profit_pct in DB
-        if (profitPct !== null && alertMarket.market.id) {
-            await upsertOutcome({
-                market_id: alertMarket.market.id,
-                profit_pct: Math.round(profitPct * 100) / 100,
-            });
-        }
-
-        // Skip alert if profit is too low (market already priced in)
-        const MIN_PROFIT_PCT = 5;
-        if (profitPct !== null && profitPct < MIN_PROFIT_PCT) {
-            log.info(`SKIP ALERT (profit ${profitPct.toFixed(1)}% < ${MIN_PROFIT_PCT}%): "${event.title.slice(0, 60)}"`);
-        } else if (prices && prices.type === 'resolved' && !realPrices) {
-            log.info(`SKIP ALERT (no live prices, market likely settled): "${event.title.slice(0, 60)}"`);
         } else {
-            await sendTelegramAlert(event, alertMarket.market, { ...result, outcome: 'yes' }, prices, profitPct);
+            buyPrice = prices.type === 'book'
+                ? parseFloat(prices.noAsk)
+                : parseFloat(prices.no);
         }
+        if (!isNaN(buyPrice) && buyPrice > 0 && buyPrice < 1) {
+            profitPct = ((1.00 - buyPrice) / buyPrice) * 100;
+        }
+    }
+
+    // Store profit_pct in DB
+    if (profitPct !== null && alertMarket.market.id) {
+        await upsertOutcome({
+            market_id: alertMarket.market.id,
+            profit_pct: Math.round(profitPct * 100) / 100,
+        });
+    }
+
+    // Skip alert if no real opportunity exists
+    const MIN_PROFIT_PCT = 5;
+    if (profitPct !== null && profitPct < MIN_PROFIT_PCT) {
+        log.info(`SKIP ALERT (profit ${profitPct.toFixed(1)}% < ${MIN_PROFIT_PCT}%): "${event.title.slice(0, 60)}"`);
+    } else if (prices && prices.type === 'resolved' && !realPrices) {
+        log.info(`SKIP ALERT (no live prices, market likely settled): "${event.title.slice(0, 60)}"`);
+    } else if (profitPct === null && realPrices) {
+        // We fetched live prices but couldn't compute profit → buyPrice was 0 or >=1 → market settled
+        log.info(`SKIP ALERT (market settled, no executable price): "${event.title.slice(0, 60)}"`);
     } else {
-        log.warn(`NO YES: "${event.title.slice(0, 60)}" answer="${result.answer}"`);
+        await sendTelegramAlert(event, alertMarket.market, { ...result, outcome: alertMarket.outcome, side }, prices, profitPct);
     }
 }
 
@@ -1100,34 +1009,31 @@ async function sendTelegramAlert(event, market, result, prices, profitPct) {
         lines.push(`<i>${answer}</i>`);
     }
 
-    const outcomes = result.marketOutcomes || [];
-    if (outcomes.length > 0) {
-        const allSame = outcomes.every(m => m.outcome === outcomes[0].outcome);
-        lines.push('');
-        if (allSame && outcomes.length > 2) {
-            lines.push(`${icon(outcomes[0].outcome)} All ${outcomes.length} markets: <b>${outcomes[0].outcome.toUpperCase()}</b>`);
-        } else {
-            for (const mo of outcomes) {
-                const q = shortQuestion(event.markets?.[mo.index]?.question, event.title);
-                lines.push(`${icon(mo.outcome)} ${mo.confidence}%  ${q}`);
-            }
-        }
-    }
+    // Show only the alerted market, not every sub-market outcome
+    const side = result.side || 'yes';
+    const sideLabel = side.toUpperCase();
+    lines.push('');
+    lines.push(`${icon(result.outcome)} <b>Buy ${sideLabel}</b>: ${shortQuestion(market.question, event.title)}`);
 
     if (prices) {
         lines.push('');
         if (prices.type === 'book') {
-            lines.push(`💰 <code>YES ${prices.yesBid}/${prices.yesAsk}  ·  NO ${prices.noBid}/${prices.noAsk}</code>`);
+            const price = side === 'no' ? `${prices.noBid}/${prices.noAsk}` : `${prices.yesBid}/${prices.yesAsk}`;
+            lines.push(`💰 <code>${sideLabel} ${price}</code>`);
         } else {
-            lines.push(`💰 YES <b>${prices.yes}</b>  ·  NO <b>${prices.no}</b>`);
+            const price = side === 'no' ? prices.no : prices.yes;
+            lines.push(`💰 ${sideLabel} @ <b>${price}</b>`);
         }
     }
 
     if (profitPct !== null && profitPct !== undefined) {
-        const buyPrice = prices?.type === 'book'
-            ? prices.yesAsk
-            : prices?.yes;
-        lines.push(`📈 <b>Profit: ~${profitPct.toFixed(2)}%</b>  (buy YES @ ${buyPrice} → 1.00)`);
+        let buyPrice;
+        if (side === 'no') {
+            buyPrice = prices?.type === 'book' ? prices.noAsk : prices?.no;
+        } else {
+            buyPrice = prices?.type === 'book' ? prices.yesAsk : prices?.yes;
+        }
+        lines.push(`📈 <b>Profit: ~${profitPct.toFixed(2)}%</b>  (buy ${sideLabel} @ ${buyPrice} → 1.00)`);
     }
 
     if (!result.resolved) {

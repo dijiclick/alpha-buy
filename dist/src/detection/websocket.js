@@ -132,8 +132,15 @@ async function handleMessage(data, state) {
         for (const change of changes) {
             const price = Number(change.price || change.last_trade_price || 0);
             const tokenId = change.asset_id || data.asset_id;
-            if (price >= config.PRICE_SPIKE_THRESHOLD && tokenId) {
-                await triggerCheck(tokenId, state, `price=${price}`);
+            if (tokenId) {
+                // High YES price: potential YES opportunity (or NO mispricing detection)
+                if (price >= config.PRICE_SPIKE_THRESHOLD) {
+                    await triggerCheck(tokenId, state, `price=${price}`);
+                }
+                // Low YES price (= high NO price): potential NO opportunity
+                else if (price <= (1 - config.PRICE_SPIKE_THRESHOLD) && price > 0) {
+                    await triggerCheck(tokenId, state, `NO-price=${(1 - price).toFixed(3)}`);
+                }
             }
         }
     }
@@ -167,7 +174,7 @@ async function triggerCheck(tokenId, state, reason) {
         const event = events[0];
         if (!event || !event.markets || event.markets.length === 0) return;
 
-        log.info(`WS TRIGGER [${reason}]: "${event.title.slice(0, 60)}" — checking with LLM`);
+        log.info(`WS TRIGGER [${reason}]: "${event.title.slice(0, 60)}" — checking with Perplexity`);
         await checkAndProcessEvent(event, state);
     } catch (e) {
         log.warn(`WS trigger check failed: ${e.message}`);
