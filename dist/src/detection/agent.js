@@ -5,9 +5,9 @@ import { getAllOpenEvents, getEventsByPolymarketIds, updateEventLastChecked, ups
 import { executeTrade, isTradingReady } from '../trading/executor.js';
 const log = createLogger('agent');
 
-// ─── Bridge pool (one process per session token) ───
+// ─── MCP Bridge (single Rust perplexity-web-api-mcp process) ───
 
-const _bridges = [];
+let _mcpBridge = null;
 const DEFAULT_HOT_LOOP_INTERVAL_MS = 60_000;
 const DEFAULT_HOT_LOOKBACK_MS = 20 * 60_000;
 
@@ -19,24 +19,24 @@ function readMsEnv(name, fallback) {
 const HOT_LOOP_INTERVAL_MS = readMsEnv('HOT_LOOP_INTERVAL_MS', DEFAULT_HOT_LOOP_INTERVAL_MS);
 const HOT_LOOKBACK_MS = readMsEnv('HOT_LOOKBACK_MS', DEFAULT_HOT_LOOKBACK_MS);
 
-function spawnBridge(token, index) {
-    log.info(`Spawning bridge #${index}...`);
+function spawnMcpBridge() {
+    log.info('Spawning MCP Perplexity bridge...');
 
-    // uv uses `uv run --script bridge.py --server`, others use `python3 bridge.py --server`
-    const args = config.PYTHON_CMD === 'uv'
-        ? ['run', '--script', config.PERPLEXITY_BRIDGE_PATH, '--server']
-        : [config.PERPLEXITY_BRIDGE_PATH, '--server'];
-
-    const child = spawn(config.PYTHON_CMD,
-        args,
-        {
-            env: { ...process.env, PERPLEXITY_SESSION_TOKEN: token },
-            stdio: ['pipe', 'pipe', 'pipe'],
-        }
-    );
+    const child = spawn(config.PERPLEXITY_MCP_PATH, [], {
+        env: {
+            ...process.env,
+            PERPLEXITY_SESSION_TOKEN: config.PERPLEXITY_SESSION_TOKENS[0],
+            PERPLEXITY_CSRF_TOKEN: config.PERPLEXITY_CSRF_TOKENS[0] || '',
+        },
+        stdio: ['pipe', 'pipe', 'pipe'],
+    });
 
     let buffer = '';
-    const waiters = [];
+    const pending = new Map(); // id → { resolve, reject, timer }
+    let nextId = 1;
+    let initialized = false;
+    let initResolve = null;
+    const initPromise = new Promise(r => { initResolve = r; });
 
     child.stdout.on('data', (chunk) => {
         buffer += chunk.toString();
@@ -44,9 +44,20 @@ function spawnBridge(token, index) {
         buffer = lines.pop();
         for (const line of lines) {
             if (!line.trim()) continue;
-            const entry = waiters.shift();
-            if (entry) {
-                entry.resolve(line);
+            try {
+                const msg = JSON.parse(line);
+                if (msg.id != null && pending.has(msg.id)) {
+                    const entry = pending.get(msg.id);
+                    pending.delete(msg.id);
+                    clearTimeout(entry.timer);
+                    if (msg.error) {
+                        entry.reject(new Error(msg.error.message || JSON.stringify(msg.error)));
+                    } else {
+                        entry.resolve(msg.result);
+                    }
+                }
+            } catch (e) {
+                log.warn(`MCP bridge: failed to parse response: ${line.slice(0, 200)}`);
             }
         }
     });
@@ -54,94 +65,100 @@ function spawnBridge(token, index) {
     child.stderr.on('data', d => {
         const msg = d.toString().trim();
         if (!msg) return;
-        if (/RATE_LIMITED|SESSION_ERR|ERROR|FAILED/i.test(msg)) {
-            log.warn(`Bridge#${index}: ${msg.slice(0, 500)}`);
+        if (/error|warn|fail/i.test(msg)) {
+            log.warn(`MCP bridge: ${msg.slice(0, 500)}`);
         }
-        // Skip verbose REQ/OK/STATS lines from bridge stderr
     });
 
-    const b = {
+    const bridge = {
         child,
         dead: false,
-        index,
+        ready: initPromise,
 
-        query(input) {
+        _send(method, params = {}) {
+            const id = nextId++;
             return new Promise((resolve, reject) => {
-                if (this.dead) return reject(new Error(`Bridge#${index} is dead`));
-
-                const entry = { done: false };
-
-                entry.timer = setTimeout(() => {
-                    if (entry.done) return;
-                    entry.done = true;
-                    const idx = waiters.indexOf(entry);
-                    if (idx !== -1) waiters.splice(idx, 1);
-                    reject(new Error(`Bridge#${index} timeout (90s)`));
-                }, 90_000);
-
-                entry.resolve = (line) => {
-                    if (entry.done) return;
-                    entry.done = true;
-                    clearTimeout(entry.timer);
-                    resolve(line);
-                };
-
-                entry.reject = (err) => {
-                    if (entry.done) return;
-                    entry.done = true;
-                    clearTimeout(entry.timer);
-                    reject(err);
-                };
-
-                waiters.push(entry);
-                child.stdin.write(JSON.stringify(input) + '\n');
+                if (this.dead) return reject(new Error('MCP bridge is dead'));
+                const timer = setTimeout(() => {
+                    pending.delete(id);
+                    reject(new Error(`MCP bridge timeout (120s) for ${method}`));
+                }, 120_000);
+                pending.set(id, { resolve, reject, timer });
+                child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
             });
+        },
+
+        _notify(method, params = {}) {
+            child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
+        },
+
+        async callTool(name, args) {
+            await this.ready;
+            const result = await this._send('tools/call', { name, arguments: args });
+            // MCP tool results have content array: [{type: "text", text: "..."}]
+            if (result?.content) {
+                return result.content.map(c => c.text || '').join('\n');
+            }
+            return typeof result === 'string' ? result : JSON.stringify(result);
         },
 
         kill() {
             this.dead = true;
+            for (const [id, entry] of pending) {
+                clearTimeout(entry.timer);
+                entry.reject(new Error('MCP bridge killed'));
+            }
+            pending.clear();
             child.kill();
         }
     };
 
     child.on('close', (code) => {
-        log.warn(`Bridge#${index} exited (code ${code})`);
-        b.dead = true;
-        while (waiters.length) {
-            const entry = waiters.shift();
-            if (!entry.done) {
-                entry.done = true;
-                clearTimeout(entry.timer);
-                entry.reject(new Error(`Bridge#${index} died (code ${code})`));
-            }
+        log.warn(`MCP bridge exited (code ${code})`);
+        bridge.dead = true;
+        for (const [id, entry] of pending) {
+            clearTimeout(entry.timer);
+            entry.reject(new Error(`MCP bridge died (code ${code})`));
         }
+        pending.clear();
+        if (_mcpBridge === bridge) _mcpBridge = null;
     });
 
     child.on('error', (e) => {
-        log.warn(`Bridge#${index} spawn error: ${e.message}`);
-        b.dead = true;
+        log.warn(`MCP bridge spawn error: ${e.message}`);
+        bridge.dead = true;
+        if (_mcpBridge === bridge) _mcpBridge = null;
     });
 
-    return b;
+    // MCP handshake
+    bridge._send('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: {},
+        clientInfo: { name: 'polyedge', version: '1.0' },
+    }).then(() => {
+        bridge._notify('notifications/initialized');
+        initialized = true;
+        initResolve();
+        log.info('MCP bridge initialized');
+    }).catch(e => {
+        log.error(`MCP bridge init failed: ${e.message}`);
+        bridge.dead = true;
+        initResolve(); // unblock waiters so they fail on dead check
+    });
+
+    return bridge;
 }
 
-function getBridge(slotIndex) {
-    const slot = _bridges[slotIndex];
-    if (slot && slot.bridge && !slot.bridge.dead) return slot.bridge;
-
-    const token = config.PERPLEXITY_SESSION_TOKENS[slotIndex];
-    if (!token) return null;
-
-    const bridge = spawnBridge(token, slotIndex);
-    _bridges[slotIndex] = { bridge, token, index: slotIndex };
-    return bridge;
+function getBridge() {
+    if (_mcpBridge && !_mcpBridge.dead) return _mcpBridge;
+    _mcpBridge = spawnMcpBridge();
+    return _mcpBridge;
 }
 
 // ─── Public entry points ───
 
 export function startEdgeAgent(state) {
-    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
-    log.info(`Edge agent started (cycle=${config.DETECTION_INTERVAL / 1000}s, hot=${HOT_LOOP_INTERVAL_MS / 1000}s, edge=${config.EDGE_THRESHOLD * 100}%, trade=$${config.TRADE_AMOUNT}, trading=${config.TRADING_ENABLED ? 'LIVE' : 'DRY RUN'}, ${concurrency} bridges)`);
+    log.info(`Edge agent started (cycle=${config.DETECTION_INTERVAL / 1000}s, hot=${HOT_LOOP_INTERVAL_MS / 1000}s, edge=${config.EDGE_THRESHOLD * 100}%, trade=$${config.TRADE_AMOUNT}, trading=${config.TRADING_ENABLED ? 'LIVE' : 'DRY RUN'}, MCP bridge)`);
 
     // Full scan cycle (hourly)
     let cycleRunning = false;
@@ -195,7 +212,7 @@ export const startResolutionAgent = startEdgeAgent;
 
 // Exported so websocket.js can trigger immediate checks
 export async function checkAndProcessEvent(event, state) {
-    return processEvent(event, state.trackedEvents.get(event.polymarket_event_id), 0, state, _counters);
+    return processEvent(event, state.trackedEvents.get(event.polymarket_event_id), state, _counters);
 }
 
 const _counters = { newTracked: 0, rechecked: 0, edgesFound: 0 };
@@ -256,8 +273,6 @@ function getYesPrice(market) {
 // ─── Agent cycle: scan all events ending within 24h ───
 
 async function runAgentCycle(state) {
-    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
-
     const events = await getAllOpenEvents();
 
     const queue = [];
@@ -353,31 +368,19 @@ async function runAgentCycle(state) {
     queue.length = 0;
     queue.push(...filteredQueue);
 
-    log.info(`Agent: ${queue.length} to check (${gammaFiltered} pre-filtered closed), ${skippedResolved} resolved, ${skippedFuture} future, ${concurrency} bridges`);
+    log.info(`Agent: ${queue.length} to check (${gammaFiltered} pre-filtered closed), ${skippedResolved} resolved, ${skippedFuture} future`);
 
     const counters = { newTracked: 0, rechecked: 0, edgesFound: 0 };
 
-    // Reserve slot 0 for WebSocket triggers; agent workers use slots 1+
-    const reserveSlotForWS = concurrency >= 2;
-    const workerStart = reserveSlotForWS ? 1 : 0;
-    const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
-
-    async function worker(slotIndex) {
-        while (queue.length > 0) {
-            const item = queue.shift();
-            if (!item) break;
-            try {
-                await processEvent(item.event, item.tracked, slotIndex, state, counters, { skipGammaPreflight: true });
-            } catch (e) {
-                log.error(`Worker#${slotIndex} processEvent error: ${e.message}`);
-            }
+    // Use a single bridge (slot 0) — Perplexity limits concurrent sessions per account
+    for (const item of queue) {
+        try {
+            await processEvent(item.event, item.tracked, state, counters, { skipGammaPreflight: true });
+        } catch (e) {
+            log.error(`processEvent error: ${e.message}`);
         }
-        log.info(`Worker#${slotIndex} finished (queue empty)`);
     }
-
-    await Promise.all(
-        Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
-    );
+    log.info(`Worker finished (${queue.length} processed)`);
 
     const total = state.trackedEvents.size;
     if (total > 0 || counters.edgesFound > 0 || counters.newTracked > 0) {
@@ -388,7 +391,6 @@ async function runAgentCycle(state) {
 // ─── Hot loop: recheck tracked events approaching/past end ───
 
 async function runHotLoop(state) {
-    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
     const now = Date.now();
 
     const hotEventIds = [];
@@ -432,25 +434,13 @@ async function runHotLoop(state) {
 
     const counters = { newTracked: 0, rechecked: 0, edgesFound: 0 };
 
-    const reserveSlotForWS = concurrency >= 2;
-    const workerStart = reserveSlotForWS ? 1 : 0;
-    const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
-
-    async function worker(slotIndex) {
-        while (queue.length > 0) {
-            const item = queue.shift();
-            if (!item) break;
-            try {
-                await processEvent(item.event, item.tracked, slotIndex, state, counters);
-            } catch (e) {
-                log.error(`Hot#${slotIndex} error: ${e.message}`);
-            }
+    for (const item of queue) {
+        try {
+            await processEvent(item.event, item.tracked, state, counters);
+        } catch (e) {
+            log.error(`Hot error: ${e.message}`);
         }
     }
-
-    await Promise.all(
-        Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
-    );
 
     if (counters.edgesFound > 0 || counters.rechecked > 0) {
         log.info(`Hot: ${counters.rechecked} re-checked, ${counters.edgesFound} edges found`);
@@ -499,38 +489,16 @@ async function runDiscoveryScan(state) {
         return aEnd - bEnd;
     });
 
-    const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
-    const reserveSlotForWS = concurrency >= 2;
-    const workerStart = reserveSlotForWS ? 1 : 0;
-    const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
-
-    if (workerCount <= 0) {
-        log.warn('Discovery: no bridge slots available (all reserved for WS)');
-        return;
-    }
-
-    const queue = newEvents.map(event => ({
-        event,
-        tracked: state.trackedEvents.get(event.polymarket_event_id),
-    }));
-
     const counters = { newTracked: 0, rechecked: 0, edgesFound: 0 };
 
-    async function worker(slotIndex) {
-        while (queue.length > 0) {
-            const item = queue.shift();
-            if (!item) break;
-            try {
-                await processEvent(item.event, item.tracked, slotIndex, state, counters);
-            } catch (e) {
-                log.error(`Discovery#${slotIndex} error: ${e.message}`);
-            }
+    for (const event of newEvents) {
+        const tracked = state.trackedEvents.get(event.polymarket_event_id);
+        try {
+            await processEvent(event, tracked, state, counters);
+        } catch (e) {
+            log.error(`Discovery error: ${e.message}`);
         }
     }
-
-    await Promise.all(
-        Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
-    );
 
     if (counters.edgesFound > 0 || counters.rechecked > 0) {
         log.info(`Discovery: ${counters.rechecked} checked, ${counters.edgesFound} edges found`);
@@ -539,7 +507,7 @@ async function runDiscoveryScan(state) {
 
 // ─── Event processing: probability estimation + edge detection ───
 
-async function processEvent(event, tracked, slotIndex, state, counters, { skipGammaPreflight = false } = {}) {
+async function processEvent(event, tracked, state, counters, { skipGammaPreflight = false } = {}) {
     const eventId = event.polymarket_event_id;
 
     // Pre-flight: skip if already closed on Polymarket
@@ -566,7 +534,7 @@ async function processEvent(event, tracked, slotIndex, state, counters, { skipGa
         }
     }
 
-    const result = await checkEventWithPerplexity(event, slotIndex);
+    const result = await checkEventWithPerplexity(event);
     if (!result) return;
 
     await updateEventLastChecked(eventId);
@@ -751,12 +719,77 @@ function calculateNextCheck(estimatedEndISO, postEndCheckCount = 0) {
     return now + POST_INTERVALS[idx];
 }
 
-// ─── Perplexity bridge ───
+// ─── Perplexity MCP bridge ───
 
-async function checkEventWithPerplexity(event, slotIndex) {
-    const bridge = getBridge(slotIndex);
-    if (!bridge) {
-        log.warn(`No bridge available for slot ${slotIndex}`);
+function buildEventPrompt(event, markets) {
+    const today = new Date().toISOString().slice(0, 10);
+    const title = event.title || '';
+    const desc = (event.description || '').slice(0, 500);
+    const endDate = event.end_date || '';
+
+    const mqLines = markets.map((m, i) => {
+        const price = getYesPrice(m);
+        const priceInfo = price != null ? ` [Current market YES price: ${price}]` : '';
+        let line = `  ${i + 1}. ${m.question}${priceInfo}`;
+        if (m.description) line += `\n     Resolution rules: ${m.description.slice(0, 500)}`;
+        return line;
+    }).join('\n');
+
+    return `Today is ${today}.
+
+I need you to estimate the PROBABILITY of each market outcome based on current real-world evidence. This is for a prediction market event ending soon.
+
+Event: ${title}
+Description: ${desc || '(none)'}
+Scheduled end: ${endDate || '(none)'}
+
+Markets:
+${mqLines}
+
+Search for the LATEST news, official statements, data, polls, expert analysis, and any relevant information about this event.
+
+Rules:
+- For EACH market, estimate probability_yes (0-100): the percentage chance that YES wins.
+- Base your estimate on CONCRETE evidence: official statements, polls, expert analysis, historical patterns, recent developments.
+- Be well-calibrated: 50 = true toss-up, 80+ = strong evidence, 95+ = near-certain.
+- If the event is ALREADY officially resolved, set resolved=true and probability_yes to 100 (YES won) or 0 (NO won).
+- confidence (0-100) = how confident you are in your probability estimate. High confidence means strong evidence exists.
+- DO NOT simply echo the market price. Form your OWN independent estimate from the evidence you find.
+
+CRITICAL formatting rules:
+- reasoning: cite SPECIFIC evidence (max 30 words). E.g. "Reuters reports bill passed Senate 52-48" or "Latest polls show 65% support, committee approved unanimously"
+
+Respond with ONLY raw JSON, no markdown fences:
+{"resolved":false,"markets":[{"market":1,"probability_yes":0-100,"confidence":0-100},...], "reasoning":"cite specific evidence, max 30 words"}`;
+}
+
+function parsePerplexityResponse(text) {
+    // MCP bridge returns JSON with { answer, web_results, ... }
+    // The answer field contains our actual response (possibly with [1][2] citation markers)
+    let answer = text;
+    try {
+        const outer = JSON.parse(text);
+        if (outer.answer) answer = outer.answer;
+    } catch {
+        // Not wrapped JSON — use text directly
+    }
+
+    // Strip markdown fences
+    if (answer.includes('```json')) answer = answer.split('```json')[1];
+    if (answer.includes('```')) answer = answer.split('```')[0];
+    answer = answer.trim();
+
+    // Find the first { and last } to extract JSON (ignoring trailing citation markers like [1][2])
+    const start = answer.indexOf('{');
+    const end = answer.lastIndexOf('}');
+    if (start === -1 || end === -1) throw new Error('No JSON object found in response');
+    return JSON.parse(answer.slice(start, end + 1));
+}
+
+async function checkEventWithPerplexity(event) {
+    const bridge = getBridge();
+    if (!bridge || bridge.dead) {
+        log.warn('No MCP bridge available');
         return null;
     }
 
@@ -765,23 +798,11 @@ async function checkEventWithPerplexity(event, slotIndex) {
         const markets = event.markets.length > MAX_MARKETS
             ? event.markets.slice(0, MAX_MARKETS)
             : event.markets;
-        const input = {
-            mode: 'event',
-            event_title: event.title,
-            event_description: (event.description || '').slice(0, 500),
-            end_date: event.end_date || '',
-            market_questions: markets.map(m => m.question),
-            market_descriptions: markets.map(m => (m.description || '').slice(0, 200)),
-            market_prices: markets.map(m => getYesPrice(m)),
-        };
 
-        const line = await bridge.query(input);
-        const parsed = JSON.parse(line);
+        const prompt = buildEventPrompt(event, markets);
 
-        if (parsed.error) {
-            log.warn(`Perplexity error (bridge#${slotIndex}): ${parsed.error}`);
-            return null;
-        }
+        const responseText = await bridge.callTool('perplexity_search', { query: prompt });
+        const parsed = parsePerplexityResponse(responseText);
 
         const marketResults = Array.isArray(parsed.markets)
             ? parsed.markets.map(m => ({
@@ -799,8 +820,8 @@ async function checkEventWithPerplexity(event, slotIndex) {
         };
     }
     catch (e) {
-        log.warn(`Perplexity check failed (bridge#${slotIndex}) for "${event.title.slice(0, 60)}"`, e.message);
-        if (_bridges[slotIndex]?.bridge?.dead) _bridges[slotIndex] = null;
+        log.warn(`Perplexity check failed for "${event.title.slice(0, 60)}": ${e.message}`);
+        if (bridge.dead) _mcpBridge = null;
         return null;
     }
 }

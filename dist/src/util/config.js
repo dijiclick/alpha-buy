@@ -40,11 +40,7 @@ export const config = {
     // Perplexity (multiple tokens = concurrent bridges)
     PERPLEXITY_SESSION_TOKENS: getPerplexityTokens(),
     PERPLEXITY_CSRF_TOKENS: getPerplexityCsrfTokens(),
-    // Python bridge
-    PYTHON_CMD: optEnv('PYTHON_CMD') || 'uv',
-    PERPLEXITY_BRIDGE_PATH: optEnv('PERPLEXITY_BRIDGE_PATH')
-        || join(PROJECT_ROOT, 'scripts', 'perplexity_bridge.py'),
-    // Rust MCP binary (alternative Perplexity backend)
+    // Perplexity MCP bridge (Rust binary)
     PERPLEXITY_MCP_PATH: optEnv('PERPLEXITY_MCP_PATH')
         || join(PROJECT_ROOT, 'scripts', 'perplexity-web-api-mcp.exe'),
     // Telegram
