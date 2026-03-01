@@ -1,7 +1,8 @@
 import { spawn } from 'child_process';
 import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
-import { getAllOpenEvents, getEventsByPolymarketIds, upsertOutcome, updateEventLastChecked } from '../db/supabase.js';
+import { getAllOpenEvents, getEventsByPolymarketIds, updateEventLastChecked, upsertEdgePrediction, insertTrade, updateTradeStatus } from '../db/supabase.js';
+import { executeTrade, isTradingReady } from '../trading/executor.js';
 const log = createLogger('agent');
 
 // ─── Bridge pool (one process per session token) ───
@@ -9,7 +10,6 @@ const log = createLogger('agent');
 const _bridges = [];
 const DEFAULT_HOT_LOOP_INTERVAL_MS = 60_000;
 const DEFAULT_HOT_LOOKBACK_MS = 20 * 60_000;
-const DEFAULT_INITIAL_POST_END_DELAY_MS = 75_000;
 
 function readMsEnv(name, fallback) {
     const v = Number(process.env[name]);
@@ -18,10 +18,6 @@ function readMsEnv(name, fallback) {
 
 const HOT_LOOP_INTERVAL_MS = readMsEnv('HOT_LOOP_INTERVAL_MS', DEFAULT_HOT_LOOP_INTERVAL_MS);
 const HOT_LOOKBACK_MS = readMsEnv('HOT_LOOKBACK_MS', DEFAULT_HOT_LOOKBACK_MS);
-const INITIAL_POST_END_DELAY_MS = Math.min(
-    90_000,
-    Math.max(60_000, readMsEnv('INITIAL_POST_END_DELAY_MS', DEFAULT_INITIAL_POST_END_DELAY_MS))
-);
 
 function spawnBridge(token, index) {
     log.info(`Spawning bridge #${index}...`);
@@ -143,11 +139,11 @@ function getBridge(slotIndex) {
 
 // ─── Public entry points ───
 
-export function startResolutionAgent(state) {
+export function startEdgeAgent(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
-    log.info(`Resolution agent started (every ${config.DETECTION_INTERVAL / 1000}s, hot=${HOT_LOOP_INTERVAL_MS / 1000}s, first_post_end_delay=${INITIAL_POST_END_DELAY_MS / 1000}s, ${concurrency} bridges)`);
+    log.info(`Edge agent started (cycle=${config.DETECTION_INTERVAL / 1000}s, hot=${HOT_LOOP_INTERVAL_MS / 1000}s, edge=${config.EDGE_THRESHOLD * 100}%, trade=$${config.TRADE_AMOUNT}, trading=${config.TRADING_ENABLED ? 'LIVE' : 'DRY RUN'}, ${concurrency} bridges)`);
 
-    // Full discovery scan (hourly)
+    // Full scan cycle (hourly)
     let cycleRunning = false;
     const run = async () => {
         if (cycleRunning) {
@@ -168,10 +164,10 @@ export function startResolutionAgent(state) {
     run();
     setInterval(run, config.DETECTION_INTERVAL);
 
-    // Hot loop: checks just-ended tracked events
+    // Hot loop: rechecks tracked events approaching end
     let hotRunning = false;
     const hot = async () => {
-        if (hotRunning) return; // skip if previous hot loop still running
+        if (hotRunning) return;
         hotRunning = true;
         try {
             await runHotLoop(state);
@@ -184,30 +180,30 @@ export function startResolutionAgent(state) {
     setTimeout(hot, Math.min(30_000, HOT_LOOP_INTERVAL_MS));
     setInterval(hot, HOT_LOOP_INTERVAL_MS);
 
-    // Discovery scan: find events entering 24h horizon without Perplexity queries
+    // Discovery scan: find events entering 24h horizon
     const DISCOVERY_INTERVAL = 15 * 60_000;
     const discover = async () => {
         try { await runDiscoveryScan(state); }
         catch (e) { log.error('Discovery scan failed', e.message); }
     };
-    setTimeout(discover, 60_000); // first run after 1 min
+    setTimeout(discover, 60_000);
     setInterval(discover, DISCOVERY_INTERVAL);
-
 }
 
+// Keep backward compat export name
+export const startResolutionAgent = startEdgeAgent;
+
 // Exported so websocket.js can trigger immediate checks
-// Slot 0 is reserved for WS triggers — agent cycle uses slots 1+
 export async function checkAndProcessEvent(event, state) {
     return processEvent(event, state.trackedEvents.get(event.polymarket_event_id), 0, state, _counters);
 }
 
-const _counters = { newTracked: 0, rechecked: 0, resolved: 0 };
+const _counters = { newTracked: 0, rechecked: 0, edgesFound: 0 };
 
 function sanitizeDate(iso) {
     if (!iso) return null;
     const d = new Date(iso);
     if (isNaN(d.getTime())) {
-        // Try fixing common Perplexity errors like Feb 29 in non-leap years
         const fixed = iso.replace(/02-29/, '02-28');
         const d2 = new Date(fixed);
         if (!isNaN(d2.getTime())) return fixed;
@@ -222,7 +218,6 @@ function toFiniteNumber(value) {
 }
 
 function getYesPrice(market) {
-    // Prefer explicit YES-like fields, then fallback to the first outcome price.
     const directCandidates = [
         market.best_ask,
         market.last_trade_price,
@@ -258,26 +253,17 @@ function getYesPrice(market) {
     return null;
 }
 
-function eventHasHotPrice(event, threshold) {
-    return (event.markets || []).some(m => {
-        const price = getYesPrice(m);
-        if (price === null || price <= 0 || price >= 1) return false; // settled
-        // YES side hot (price >= threshold) OR NO side hot (price <= 1 - threshold)
-        return price >= threshold || price <= (1 - threshold);
-    });
-}
+// ─── Agent cycle: scan all events ending within 24h ───
 
 async function runAgentCycle(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
 
-    // Get all open events, then apply price-first gate for untracked events.
     const events = await getAllOpenEvents();
 
-    // Build work queue
     const queue = [];
     let skippedResolved = 0;
     let skippedFuture = 0;
-    let skippedBelowPrice = 0;
+    let skippedNoEnd = 0;
     const now = Date.now();
     const horizon = config.END_DATE_HORIZON;
 
@@ -287,28 +273,26 @@ async function runAgentCycle(state) {
 
         const eventId = event.polymarket_event_id;
 
-        // Skip events we already know are resolved
         if (state.resolvedEventIds.has(eventId)) {
             skippedResolved++;
             continue;
         }
 
-        // Skip events whose end_date is far in the future (not ending soon)
-        if (event.end_date) {
-            const endTime = new Date(event.end_date).getTime();
-            if (!isNaN(endTime) && endTime - now > horizon) {
-                skippedFuture++;
-                continue;
-            }
+        // Must have an end_date within 24h to be scanned
+        if (!event.end_date) {
+            skippedNoEnd++;
+            continue;
+        }
+        const endTime = new Date(event.end_date).getTime();
+        if (isNaN(endTime) || endTime - now > horizon) {
+            skippedFuture++;
+            continue;
         }
 
         const tracked = state.trackedEvents.get(eventId);
 
         if (!tracked) {
-            if (!eventHasHotPrice(event, config.PRICE_SPIKE_THRESHOLD)) {
-                skippedBelowPrice++;
-                continue;
-            }
+            // No price gate — all events within 24h are candidates
             queue.push({ event, tracked: null });
         }
         else if (now >= tracked.nextCheckAt) {
@@ -317,22 +301,20 @@ async function runAgentCycle(state) {
     }
 
     if (queue.length === 0) {
-        if (skippedFuture > 0 || skippedResolved > 0 || skippedBelowPrice > 0) {
-            log.info(`Agent: nothing to check. ${skippedResolved} resolved, ${skippedFuture} future (>${Math.round(horizon / 3_600_000)}h away), ${skippedBelowPrice} below price threshold`);
+        if (skippedFuture > 0 || skippedResolved > 0) {
+            log.info(`Agent: nothing to check. ${skippedResolved} resolved, ${skippedFuture} future (>${Math.round(horizon / 3_600_000)}h), ${skippedNoEnd} no end_date`);
         }
         return;
     }
 
-    // Priority sort: already-ended first, then soonest-ending
+    // Priority sort: soonest-ending first
     queue.sort((a, b) => {
         const aEnd = a.event.end_date ? new Date(a.event.end_date).getTime() : Infinity;
         const bEnd = b.event.end_date ? new Date(b.event.end_date).getTime() : Infinity;
-        const now2 = Date.now();
-        if ((aEnd <= now2) !== (bEnd <= now2)) return aEnd <= now2 ? -1 : 1;
         return aEnd - bEnd;
     });
 
-    // Batch Gamma pre-flight: check all markets in parallel before using Perplexity
+    // Batch Gamma pre-flight: filter out already-closed events
     const gammaResults = new Map();
     const GAMMA_BATCH = 20;
     for (let i = 0; i < queue.length; i += GAMMA_BATCH) {
@@ -358,7 +340,6 @@ async function runAgentCycle(state) {
         }
     }
 
-    // Filter out already-closed events
     let gammaFiltered = 0;
     const filteredQueue = queue.filter(({ event }) => {
         const closed = gammaResults.get(event.polymarket_event_id);
@@ -369,13 +350,12 @@ async function runAgentCycle(state) {
         }
         return true;
     });
-    // Replace queue contents
     queue.length = 0;
     queue.push(...filteredQueue);
 
-    log.info(`Agent: ${queue.length} to check (${gammaFiltered} pre-filtered closed), ${skippedResolved} resolved, ${skippedFuture} future, ${skippedBelowPrice} below price, ${concurrency} bridges`);
+    log.info(`Agent: ${queue.length} to check (${gammaFiltered} pre-filtered closed), ${skippedResolved} resolved, ${skippedFuture} future, ${concurrency} bridges`);
 
-    const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
+    const counters = { newTracked: 0, rechecked: 0, edgesFound: 0 };
 
     // Reserve slot 0 for WebSocket triggers; agent workers use slots 1+
     const reserveSlotForWS = concurrency >= 2;
@@ -400,19 +380,17 @@ async function runAgentCycle(state) {
     );
 
     const total = state.trackedEvents.size;
-    if (total > 0 || counters.resolved > 0 || counters.newTracked > 0) {
-        log.info(`Agent: ${counters.newTracked} new, ${counters.rechecked} re-checked, ${counters.resolved} resolved, ${total} tracking`);
+    if (total > 0 || counters.edgesFound > 0 || counters.newTracked > 0) {
+        log.info(`Agent: ${counters.newTracked} new, ${counters.rechecked} re-checked, ${counters.edgesFound} edges found, ${total} tracking`);
     }
 }
 
-// ─── Hot loop: events ending NOW (every 2 min) ───
-// Uses Perplexity's estimatedEndMin (precise) instead of Polymarket's end_date (imprecise)
+// ─── Hot loop: recheck tracked events approaching/past end ───
 
 async function runHotLoop(state) {
     const concurrency = config.PERPLEXITY_SESSION_TOKENS.length;
     const now = Date.now();
 
-    // Scan tracked events for those whose estimatedEndMin has passed and are due by nextCheckAt.
     const hotEventIds = [];
     for (const [eventId, tracked] of state.trackedEvents) {
         if (!tracked.estimatedEndMin) continue;
@@ -420,10 +398,9 @@ async function runHotLoop(state) {
         if (isNaN(endTime)) continue;
         const nextCheckAt = Number.isFinite(Number(tracked.nextCheckAt))
             ? Number(tracked.nextCheckAt)
-            : (endTime + INITIAL_POST_END_DELAY_MS);
+            : now;
         if (now < nextCheckAt) continue;
         const elapsed = now - endTime;
-        // Only events that ended recently
         if (elapsed > 0 && elapsed <= HOT_LOOKBACK_MS) {
             hotEventIds.push(eventId);
         }
@@ -431,11 +408,9 @@ async function runHotLoop(state) {
 
     if (hotEventIds.length === 0) return;
 
-    // Fetch full event data from DB (need markets for processEvent)
     const events = await getEventsByPolymarketIds(hotEventIds);
     const eventMap = new Map(events.map(e => [e.polymarket_event_id, e]));
 
-    // Build queue with tracked data, sorted by urgency
     const queue = [];
     for (const eventId of hotEventIds) {
         const event = eventMap.get(eventId);
@@ -447,18 +422,16 @@ async function runHotLoop(state) {
 
     if (queue.length === 0) return;
 
-    // Sort: most recently ended first (smallest elapsed time)
     queue.sort((a, b) => {
         const aEnd = new Date(a.tracked.estimatedEndMin).getTime();
         const bEnd = new Date(b.tracked.estimatedEndMin).getTime();
-        return bEnd - aEnd; // newest end first
+        return bEnd - aEnd;
     });
 
-    log.info(`Hot: ${queue.length} events just ended (checking for resolution)`);
+    log.info(`Hot: ${queue.length} events near/past end (rechecking for edge)`);
 
-    const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
+    const counters = { newTracked: 0, rechecked: 0, edgesFound: 0 };
 
-    // Reserve slot 0 for WebSocket triggers; hot loop uses slots 1+
     const reserveSlotForWS = concurrency >= 2;
     const workerStart = reserveSlotForWS ? 1 : 0;
     const workerCount = reserveSlotForWS ? concurrency - 1 : concurrency;
@@ -479,12 +452,12 @@ async function runHotLoop(state) {
         Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
     );
 
-    if (counters.resolved > 0 || counters.rechecked > 0 || counters.newTracked > 0) {
-        log.info(`Hot: ${counters.newTracked} new, ${counters.rechecked} re-checked, ${counters.resolved} resolved`);
+    if (counters.edgesFound > 0 || counters.rechecked > 0) {
+        log.info(`Hot: ${counters.rechecked} re-checked, ${counters.edgesFound} edges found`);
     }
 }
 
-// ─── Discovery scan: lightweight tracking without Perplexity ───
+// ─── Discovery scan: track events entering 24h horizon ───
 
 async function runDiscoveryScan(state) {
     const events = await getAllOpenEvents();
@@ -498,11 +471,10 @@ async function runDiscoveryScan(state) {
         if (state.resolvedEventIds.has(eventId)) continue;
         if (state.trackedEvents.has(eventId)) continue;
 
-        if (!event.end_date) continue; // no end_date = can't schedule
+        if (!event.end_date) continue;
         const endTime = new Date(event.end_date).getTime();
         if (isNaN(endTime) || endTime - now > horizon) continue;
 
-        // Add to tracking
         state.trackedEvents.set(eventId, {
             eventId,
             title: event.title,
@@ -521,8 +493,6 @@ async function runDiscoveryScan(state) {
 
     log.info(`Discovery: ${newEvents.length} new events entering 24h horizon (${state.trackedEvents.size} total tracked)`);
 
-    // Immediately check newly discovered events with Perplexity
-    // Sort soonest-ending first
     newEvents.sort((a, b) => {
         const aEnd = new Date(a.end_date).getTime();
         const bEnd = new Date(b.end_date).getTime();
@@ -544,7 +514,7 @@ async function runDiscoveryScan(state) {
         tracked: state.trackedEvents.get(event.polymarket_event_id),
     }));
 
-    const counters = { newTracked: 0, rechecked: 0, resolved: 0 };
+    const counters = { newTracked: 0, rechecked: 0, edgesFound: 0 };
 
     async function worker(slotIndex) {
         while (queue.length > 0) {
@@ -562,18 +532,17 @@ async function runDiscoveryScan(state) {
         Array.from({ length: Math.min(workerCount, queue.length) }, (_, i) => worker(i + workerStart))
     );
 
-    if (counters.resolved > 0 || counters.rechecked > 0) {
-        log.info(`Discovery: ${counters.rechecked} checked, ${counters.resolved} resolved immediately`);
+    if (counters.edgesFound > 0 || counters.rechecked > 0) {
+        log.info(`Discovery: ${counters.rechecked} checked, ${counters.edgesFound} edges found`);
     }
 }
 
-// ─── Event processing ───
+// ─── Event processing: probability estimation + edge detection ───
 
 async function processEvent(event, tracked, slotIndex, state, counters, { skipGammaPreflight = false } = {}) {
     const eventId = event.polymarket_event_id;
 
-    // Pre-flight: skip if already closed on Polymarket (saves expensive Perplexity query)
-    // Skipped when agent cycle already batch-checked Gamma upfront
+    // Pre-flight: skip if already closed on Polymarket
     if (!skipGammaPreflight) {
         const firstMarket = event.markets?.[0];
         if (firstMarket?.polymarket_market_id) {
@@ -587,7 +556,7 @@ async function processEvent(event, tracked, slotIndex, state, counters, { skipGa
                         return;
                     }
                 } else {
-                    log.warn(`Gamma API ${gmRes.status} for "${event.title.slice(0, 60)}", skipping to be safe`);
+                    log.warn(`Gamma API ${gmRes.status} for "${event.title.slice(0, 60)}", skipping`);
                     return;
                 }
             } catch (e) {
@@ -600,63 +569,166 @@ async function processEvent(event, tracked, slotIndex, state, counters, { skipGa
     const result = await checkEventWithPerplexity(event, slotIndex);
     if (!result) return;
 
-    // Record when this event was last checked by the agent
     await updateEventLastChecked(eventId);
 
-    if (!tracked) {
-        if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
-            await writeEventResults(event, result);
-            state.trackedEvents.delete(eventId);
-            state.resolvedEventIds.set(eventId, Date.now());
-            counters.resolved++;
-        }
-        else {
-            await writeEventEstimatedEnds(event, result);
-            const nextCheck = calculateNextCheck(result.estimatedEndMin, 0);
-            state.trackedEvents.set(eventId, {
-                eventId,
-                title: event.title,
-                marketCount: event.markets.length,
-                estimatedEndMin: result.estimatedEndMin || null,
-                estimatedEndMax: result.estimatedEndMax || null,
-                lastChecked: Date.now(),
-                checkCount: 1,
-                postEndCheckCount: 0,
-                nextCheckAt: nextCheck,
+    // If event is already resolved, mark it and skip edge detection
+    if (result.resolved) {
+        state.resolvedEventIds.set(eventId, Date.now());
+        state.trackedEvents.delete(eventId);
+        log.info(`RESOLVED: "${event.title.slice(0, 60)}" — ${result.reasoning}`);
+        return;
+    }
+
+    // Edge detection for each market
+    for (const mktResult of result.markets) {
+        const market = event.markets[mktResult.index];
+        if (!market) continue;
+
+        const yesPrice = getYesPrice(market);
+        if (yesPrice === null || yesPrice <= 0 || yesPrice >= 1) continue;
+
+        const noPrice = 1 - yesPrice;
+        const aiProbYes = mktResult.probabilityYes / 100;
+        const aiProbNo = 1 - aiProbYes;
+
+        // Check both sides for edge
+        const yesEdge = aiProbYes - yesPrice;   // positive = YES is underpriced
+        const noEdge = aiProbNo - noPrice;       // positive = NO is underpriced
+
+        // Store prediction in DB regardless of edge
+        try {
+            await upsertEdgePrediction({
+                event_id: eventId,
+                event_title: event.title,
+                event_slug: event.slug,
+                event_end_date: event.end_date,
+                market_id: market.polymarket_market_id,
+                market_question: market.question,
+                predicted_outcome: aiProbYes >= 0.5 ? 'yes' : 'no',
+                probability: mktResult.probabilityYes,
+                reasoning: result.reasoning,
+                yes_price: yesPrice,
+                no_price: noPrice,
+                divergence: Math.max(yesEdge, noEdge),
             });
-            counters.newTracked++;
-            log.info(`TRACKING: "${event.title.slice(0, 80)}" est: ${result.estimatedEndMin || '?'}..${result.estimatedEndMax || '?'}, next: ${new Date(nextCheck).toISOString()}`);
+        } catch (e) {
+            log.warn(`Failed to upsert edge prediction: ${e.message}`);
+        }
+
+        // Check for actionable edge
+        if (yesEdge >= config.EDGE_THRESHOLD && mktResult.confidence >= config.MIN_CONFIDENCE) {
+            await handleEdgeTrade(event, market, 'YES', yesPrice, aiProbYes, yesEdge, mktResult, result, state);
+            counters.edgesFound++;
+        } else if (noEdge >= config.EDGE_THRESHOLD && mktResult.confidence >= config.MIN_CONFIDENCE) {
+            await handleEdgeTrade(event, market, 'NO', noPrice, aiProbNo, noEdge, mktResult, result, state);
+            counters.edgesFound++;
         }
     }
-    else {
-        tracked.lastChecked = Date.now();
-        tracked.checkCount++;
 
-        if (result.resolved && result.confidence >= config.MIN_CONFIDENCE) {
-            await writeEventResults(event, result);
-            state.trackedEvents.delete(eventId);
-            state.resolvedEventIds.set(eventId, Date.now());
-            counters.resolved++;
-            log.info(`RESOLVED after ${tracked.checkCount} checks: "${event.title.slice(0, 80)}" → ${result.answer}`);
+    // Update tracking
+    const endDateISO = event.end_date;
+    const checkCount = tracked ? tracked.checkCount + 1 : 1;
+
+    if (!tracked) {
+        const nextCheck = calculateNextCheck(endDateISO, 0);
+        state.trackedEvents.set(eventId, {
+            eventId,
+            title: event.title,
+            marketCount: event.markets.length,
+            estimatedEndMin: endDateISO,
+            estimatedEndMax: null,
+            lastChecked: Date.now(),
+            checkCount: 1,
+            postEndCheckCount: 0,
+            nextCheckAt: nextCheck,
+        });
+        counters.newTracked++;
+    } else {
+        tracked.lastChecked = Date.now();
+        tracked.checkCount = checkCount;
+        const endTime = tracked.estimatedEndMin ? new Date(tracked.estimatedEndMin).getTime() : NaN;
+        if (!isNaN(endTime) && endTime <= Date.now()) {
+            tracked.postEndCheckCount = (tracked.postEndCheckCount || 0) + 1;
+        } else {
+            tracked.postEndCheckCount = 0;
         }
-        else {
-            if (result.estimatedEndMin) {
-                tracked.estimatedEndMin = result.estimatedEndMin;
-                tracked.estimatedEndMax = result.estimatedEndMax;
-                await writeEventEstimatedEnds(event, result);
-            }
-            const endTime = tracked.estimatedEndMin ? new Date(tracked.estimatedEndMin).getTime() : NaN;
-            if (!isNaN(endTime) && endTime <= Date.now()) {
-                tracked.postEndCheckCount = (tracked.postEndCheckCount || 0) + 1;
-            }
-            else {
-                tracked.postEndCheckCount = 0;
-            }
-            tracked.nextCheckAt = calculateNextCheck(tracked.estimatedEndMin, tracked.postEndCheckCount || 0);
-            counters.rechecked++;
-        }
+        tracked.nextCheckAt = calculateNextCheck(tracked.estimatedEndMin, tracked.postEndCheckCount || 0);
+        counters.rechecked++;
     }
 }
+
+// ─── Edge trade handler ───
+
+async function handleEdgeTrade(event, market, side, buyPrice, aiProb, edge, mktResult, result, state) {
+    const tradeAmount = config.TRADE_AMOUNT;
+    const shares = tradeAmount / buyPrice;
+
+    log.info(`EDGE FOUND: "${market.question.slice(0, 60)}" → ${side} @ ${buyPrice.toFixed(3)}, AI=${(aiProb * 100).toFixed(0)}%, edge=${(edge * 100).toFixed(1)}%, conf=${mktResult.confidence}%`);
+
+    // Check if we already have an open trade on this market+side
+    // (avoid duplicate buys on rechecks)
+    const existingKey = `${market.polymarket_market_id}_${side}`;
+    if (state.activePositions?.has(existingKey)) {
+        log.info(`SKIP TRADE (already have position): ${existingKey}`);
+        return;
+    }
+
+    // Determine token ID
+    let tokenIds = market.clob_token_ids;
+    if (typeof tokenIds === 'string') {
+        try { tokenIds = JSON.parse(tokenIds); } catch { tokenIds = []; }
+    }
+    const tokenId = side === 'YES' ? tokenIds?.[0] : tokenIds?.[1];
+
+    // Record trade intent in DB
+    let tradeRecord;
+    try {
+        tradeRecord = await insertTrade({
+            event_id: event.polymarket_event_id,
+            market_id: market.polymarket_market_id,
+            market_question: market.question,
+            side,
+            token_id: tokenId || null,
+            buy_price: buyPrice,
+            shares,
+            amount_usd: tradeAmount,
+            ai_probability: aiProb,
+            edge_pct: edge * 100,
+            confidence: mktResult.confidence,
+            reasoning: result.reasoning,
+            status: 'pending',
+        });
+    } catch (e) {
+        log.error(`Failed to record trade: ${e.message}`);
+        return;
+    }
+
+    const tradeId = tradeRecord?.id || tradeRecord?.[0]?.id;
+
+    // Execute trade or dry-run
+    if (isTradingReady()) {
+        try {
+            const orderResult = await executeTrade(market, side, tradeAmount, buyPrice);
+            if (tradeId) await updateTradeStatus(tradeId, 'filled', { order_id: orderResult?.orderID, fill_price: buyPrice });
+
+            // Track position for auto-redeem
+            if (state.activePositions) {
+                state.activePositions.set(existingKey, { side, shares, buyPrice, tradeId, eventId: event.polymarket_event_id });
+            }
+
+            await sendTradeNotification(event, market, side, buyPrice, aiProb, edge, shares, 'EXECUTED', result.reasoning);
+        } catch (e) {
+            log.error(`Trade execution failed: ${e.message}`);
+            if (tradeId) await updateTradeStatus(tradeId, 'failed', { reasoning: e.message });
+            await sendTradeNotification(event, market, side, buyPrice, aiProb, edge, shares, 'FAILED', e.message);
+        }
+    } else {
+        if (tradeId) await updateTradeStatus(tradeId, 'dry_run', {});
+        await sendTradeNotification(event, market, side, buyPrice, aiProb, edge, shares, 'DRY RUN', result.reasoning);
+    }
+}
+
+// ─── Scheduling ───
 
 function calculateNextCheck(estimatedEndISO, postEndCheckCount = 0) {
     if (!estimatedEndISO) return Date.now() + config.DETECTION_INTERVAL;
@@ -665,16 +737,16 @@ function calculateNextCheck(estimatedEndISO, postEndCheckCount = 0) {
     const now = Date.now();
     const remaining = endTime - now;
 
-    // Event hasn't ended yet → schedule first confirmation slightly after end.
     if (remaining > 0) {
-        if (remaining > 3 * 24 * 3600000) return endTime - 24 * 3600000; // >3d: wake 24h before
-        if (remaining > 24 * 3600000) return now + 6 * 3600000;          // 1-3d: every 6h
-        if (remaining > 4 * 3600000) return now + 2 * 3600000;           // 4-24h: every 2h
-        return endTime + INITIAL_POST_END_DELAY_MS;                       // <4h: first check ~60-90s after end
+        if (remaining > 12 * 3600000) return now + 4 * 3600000;    // >12h: every 4h
+        if (remaining > 6 * 3600000) return now + 2 * 3600000;     // 6-12h: every 2h
+        if (remaining > 2 * 3600000) return now + 1 * 3600000;     // 2-6h: every 1h
+        if (remaining > 30 * 60000) return now + 30 * 60000;       // 30min-2h: every 30min
+        return now + 15 * 60000;                                     // <30min: every 15min
     }
 
-    // Event already ended → recheck with escalating backoff
-    const POST_INTERVALS = [60000, 2 * 60000, 5 * 60000, 10 * 60000]; // 1m, 2m, 5m, 10m
+    // Past end: escalating backoff then stop
+    const POST_INTERVALS = [5 * 60000, 15 * 60000, 60 * 60000];
     const idx = Math.min(Math.max(postEndCheckCount - 1, 0), POST_INTERVALS.length - 1);
     return now + POST_INTERVALS[idx];
 }
@@ -689,7 +761,6 @@ async function checkEventWithPerplexity(event, slotIndex) {
     }
 
     try {
-        // Cap markets to avoid HTTP 414 (URI Too Long) on events with many sub-markets
         const MAX_MARKETS = 15;
         const markets = event.markets.length > MAX_MARKETS
             ? event.markets.slice(0, MAX_MARKETS)
@@ -701,6 +772,7 @@ async function checkEventWithPerplexity(event, slotIndex) {
             end_date: event.end_date || '',
             market_questions: markets.map(m => m.question),
             market_descriptions: markets.map(m => (m.description || '').slice(0, 200)),
+            market_prices: markets.map(m => getYesPrice(m)),
         };
 
         const line = await bridge.query(input);
@@ -711,22 +783,17 @@ async function checkEventWithPerplexity(event, slotIndex) {
             return null;
         }
 
-        const marketOutcomes = Array.isArray(parsed.markets)
+        const marketResults = Array.isArray(parsed.markets)
             ? parsed.markets.map(m => ({
                 index: (m.market || 1) - 1,
-                outcome: m.outcome || 'unknown',
+                probabilityYes: Number(m.probability_yes) || 50,
                 confidence: Number(m.confidence) || 0,
             }))
             : [];
 
         return {
             resolved: parsed.resolved === true,
-            answer: parsed.answer || 'unknown',
-            marketOutcomes,
-            confidence: Number(parsed.confidence) || 0,
-            estimatedEnd: sanitizeDate(parsed.estimated_end),
-            estimatedEndMin: sanitizeDate(parsed.estimated_end_min || parsed.estimated_end),
-            estimatedEndMax: sanitizeDate(parsed.estimated_end_max || parsed.estimated_end),
+            markets: marketResults,
             reasoning: parsed.reasoning || '',
             source: 'perplexity',
         };
@@ -738,159 +805,6 @@ async function checkEventWithPerplexity(event, slotIndex) {
     }
 }
 
-// ─── Result mapping ───
-
-async function writeEventResults(event, result) {
-    const markets = event.markets;
-    const outcomes = result.marketOutcomes || [];
-
-    const outcomeMap = new Map();
-    for (const mo of outcomes) {
-        if (mo.index >= 0 && mo.index < markets.length) {
-            outcomeMap.set(mo.index, mo);
-        }
-    }
-
-    // Find the best mispricing opportunity across all markets (YES or NO)
-    let alertMarket = null;
-    let bestProfit = -Infinity;
-
-    for (let i = 0; i < markets.length; i++) {
-        const mo = outcomeMap.get(i);
-        const outcome = mo ? mo.outcome : 'unknown';
-        const conf = mo ? mo.confidence : result.confidence;
-
-        await writeResult(markets[i], {
-            ...result,
-            outcome,
-            confidence: conf,
-            resolved: result.resolved,
-        });
-
-        // Skip unknown outcomes — no actionable signal
-        if (outcome === 'unknown' || conf < config.MIN_CONFIDENCE) continue;
-
-        // Calculate mispricing profit for this market
-        const yesPrice = getYesPrice(markets[i]);
-        if (yesPrice === null) continue;
-
-        let profit, side;
-        if (outcome === 'yes') {
-            // Real outcome is YES → buy YES token (currently at yesPrice)
-            if (yesPrice <= 0 || yesPrice >= 1) continue; // settled, no opportunity
-            profit = (1.0 - yesPrice) / yesPrice;
-            side = 'yes';
-        } else {
-            // Real outcome is NO → buy NO token (currently at 1 - yesPrice)
-            const noPrice = 1.0 - yesPrice;
-            if (noPrice <= 0 || noPrice >= 1) continue; // settled, no opportunity
-            profit = (1.0 - noPrice) / noPrice;
-            side = 'no';
-        }
-
-        if (profit > bestProfit) {
-            bestProfit = profit;
-            alertMarket = { market: markets[i], confidence: conf, side, outcome };
-        }
-    }
-
-    if (!alertMarket) {
-        log.info(`NO OPPORTUNITY: "${event.title.slice(0, 60)}" — no confident outcome`);
-        return;
-    }
-
-    const side = alertMarket.side;
-    log.info(`MAPPED: "${event.title.slice(0, 60)}" → "${alertMarket.market.question.slice(0, 60)}" = ${alertMarket.outcome.toUpperCase()} → buy ${side.toUpperCase()} (${alertMarket.confidence}%)`);
-
-    // Fetch real prices
-    const realPrices = await fetchPrices(alertMarket.market);
-    const prices = realPrices || (result.resolved ? { type: 'resolved', yes: '1.00', no: '0.00' } : null);
-
-    // Calculate profit % for resolved events with live prices
-    let profitPct = null;
-    if (result.resolved && prices && prices.type !== 'resolved') {
-        let buyPrice;
-        if (side === 'yes') {
-            buyPrice = prices.type === 'book'
-                ? parseFloat(prices.yesAsk)
-                : parseFloat(prices.yes);
-        } else {
-            buyPrice = prices.type === 'book'
-                ? parseFloat(prices.noAsk)
-                : parseFloat(prices.no);
-        }
-        if (!isNaN(buyPrice) && buyPrice > 0 && buyPrice < 1) {
-            profitPct = ((1.00 - buyPrice) / buyPrice) * 100;
-        }
-    }
-
-    // Store profit_pct in DB
-    if (profitPct !== null && alertMarket.market.id) {
-        await upsertOutcome({
-            market_id: alertMarket.market.id,
-            profit_pct: Math.round(profitPct * 100) / 100,
-        });
-    }
-
-    // Skip alert if no real opportunity exists
-    const MIN_PROFIT_PCT = 5;
-    if (profitPct !== null && profitPct < MIN_PROFIT_PCT) {
-        log.info(`SKIP ALERT (profit ${profitPct.toFixed(1)}% < ${MIN_PROFIT_PCT}%): "${event.title.slice(0, 60)}"`);
-    } else if (prices && prices.type === 'resolved' && !realPrices) {
-        log.info(`SKIP ALERT (no live prices, market likely settled): "${event.title.slice(0, 60)}"`);
-    } else if (profitPct === null && realPrices) {
-        // We fetched live prices but couldn't compute profit → buyPrice was 0 or >=1 → market settled
-        log.info(`SKIP ALERT (market settled, no executable price): "${event.title.slice(0, 60)}"`);
-    } else {
-        await sendTelegramAlert(event, alertMarket.market, { ...result, outcome: alertMarket.outcome, side }, prices, profitPct);
-    }
-}
-
-async function writeEventEstimatedEnds(event, result) {
-    for (const mkt of event.markets) {
-        await writeEstimatedEnd(mkt, result);
-    }
-}
-
-// ─── DB writers ───
-
-async function writeResult(market, result) {
-    const dbId = market.id;
-    if (!dbId) {
-        log.error(`Cannot find DB id for market ${market.polymarket_market_id}`);
-        return;
-    }
-
-    await upsertOutcome({
-        market_id: dbId,
-        detected_outcome: result.outcome,
-        confidence: result.confidence,
-        detection_source: result.source,
-        detected_at: new Date().toISOString(),
-        estimated_end_min: null,
-        estimated_end_max: null,
-        is_resolved: true,
-    });
-
-    log.info(`RESULT: "${market.question.slice(0, 80)}" → ${result.outcome} (${result.confidence}%)`);
-}
-
-async function writeEstimatedEnd(market, result) {
-    const dbId = market.id;
-    if (!dbId) return;
-
-    await upsertOutcome({
-        market_id: dbId,
-        detected_outcome: 'pending',
-        confidence: 0,
-        detection_source: result.source,
-        detected_at: new Date().toISOString(),
-        estimated_end_min: result.estimatedEndMin || null,
-        estimated_end_max: result.estimatedEndMax || null,
-        is_resolved: false,
-    });
-}
-
 // ─── Prices ───
 
 function parseTokenIds(market) {
@@ -900,7 +814,7 @@ function parseTokenIds(market) {
     return raw.length >= 2 ? raw : null;
 }
 
-async function fetchPrices(market) {
+export async function fetchPrices(market) {
     try {
         let bookResult = null;
         const tokenIds = parseTokenIds(market);
@@ -916,7 +830,6 @@ async function fetchPrices(market) {
                 const bid = parseFloat(yesBid) || 0;
                 const ask = parseFloat(yesAsk) || 1;
                 const spread = ask - bid;
-                // Only trust book if spread is tight (< 20¢); wide spread = thin book
                 if (spread < 0.20) {
                     return {
                         type: 'book',
@@ -924,7 +837,6 @@ async function fetchPrices(market) {
                         noBid: noBook.bids?.[0]?.price || '—', noAsk: noBook.asks?.[0]?.price || '—',
                     };
                 }
-                // Save book data in case Gamma also fails
                 bookResult = {
                     type: 'book',
                     yesBid: yesBid || '—', yesAsk: yesAsk || '—',
@@ -933,7 +845,6 @@ async function fetchPrices(market) {
             }
         }
 
-        // Gamma API gives mid-market price (what the UI shows)
         if (market.polymarket_market_id) {
             const res = await fetch(`${config.GAMMA_BASE}/markets/${market.polymarket_market_id}`);
             if (res.ok) {
@@ -945,7 +856,6 @@ async function fetchPrices(market) {
             }
         }
 
-        // Fall back to wide book if we have it
         if (bookResult) return bookResult;
 
         const stored = typeof market.outcome_prices === 'string'
@@ -956,12 +866,12 @@ async function fetchPrices(market) {
 
         return null;
     } catch (e) {
-        log.warn(`Failed to fetch prices for "${market.question.slice(0, 40)}"`, e.message);
+        log.warn(`Failed to fetch prices for "${market.question?.slice(0, 40)}"`, e.message);
         return null;
     }
 }
 
-// ─── Telegram ───
+// ─── Telegram notifications ───
 
 function formatDate(iso) {
     if (!iso) return null;
@@ -975,81 +885,32 @@ function formatDate(iso) {
     } catch { return iso; }
 }
 
-function shortQuestion(q, eventTitle) {
-    if (!q) return '?';
-    const titleWords = (eventTitle || '').split(/\s+/).slice(0, 4).join(' ');
-    if (titleWords.length > 10 && q.startsWith(titleWords)) {
-        q = q.slice(eventTitle.length).replace(/^\s*[-–—:]\s*/, '').trim() || q;
-    }
-    return q.length > 50 ? q.slice(0, 47) + '...' : q;
-}
-
-async function sendTelegramAlert(event, market, result, prices, profitPct) {
+async function sendTradeNotification(event, market, side, buyPrice, aiProb, edge, shares, status, detail) {
     if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) return;
 
-    // Gamma pre-flight already verified market is open in processEvent (5-30s ago).
-    // Redundant check removed for speed.
-
+    const icon = status === 'EXECUTED' ? '💰' : status === 'DRY RUN' ? '👀' : '❌';
     const eventUrl = `https://polymarket.com/event/${event.slug || ''}`;
     const marketUrl = `https://polymarket.com/event/${event.slug || ''}/${market.slug || ''}`;
 
-    const icon = r => r === 'yes' ? '✅' : r === 'no' ? '❌' : '❓';
+    const lines = [
+        `${icon} <b>EDGE ${status}</b>`,
+        '',
+        `<b>${event.title}</b>`,
+        `${market.question?.slice(0, 80)}`,
+        '',
+        `📊 Buy <b>${side}</b> @ ${buyPrice.toFixed(3)}`,
+        `🤖 AI Probability: ${(aiProb * 100).toFixed(0)}%`,
+        `📈 Edge: ${(edge * 100).toFixed(1)}%`,
+        `💵 ${shares.toFixed(1)} shares ($${config.TRADE_AMOUNT})`,
+    ];
 
-    const lines = [];
-    if (result.resolved) {
-        lines.push(`🟢 <b>RESOLVED</b>  ·  ${result.confidence}%`);
-    } else {
-        lines.push(`🟡 <b>PENDING</b>`);
-    }
-    lines.push('');
-    lines.push(`<b>${event.title}</b>`);
-
-    const answer = result.answer || result.reasoning || '';
-    if (answer && answer !== 'unknown') {
-        lines.push(`<i>${answer}</i>`);
-    }
-
-    // Show only the alerted market, not every sub-market outcome
-    const side = result.side || 'yes';
-    const sideLabel = side.toUpperCase();
-    lines.push('');
-    lines.push(`${icon(result.outcome)} <b>Buy ${sideLabel}</b>: ${shortQuestion(market.question, event.title)}`);
-
-    if (prices) {
-        lines.push('');
-        if (prices.type === 'book') {
-            const price = side === 'no' ? `${prices.noBid}/${prices.noAsk}` : `${prices.yesBid}/${prices.yesAsk}`;
-            lines.push(`💰 <code>${sideLabel} ${price}</code>`);
-        } else {
-            const price = side === 'no' ? prices.no : prices.yes;
-            lines.push(`💰 ${sideLabel} @ <b>${price}</b>`);
-        }
+    if (event.end_date) {
+        const fDate = formatDate(event.end_date);
+        if (fDate) lines.push(`📅 Ends: ${fDate}`);
     }
 
-    if (profitPct !== null && profitPct !== undefined) {
-        let buyPrice;
-        if (side === 'no') {
-            buyPrice = prices?.type === 'book' ? prices.noAsk : prices?.no;
-        } else {
-            buyPrice = prices?.type === 'book' ? prices.yesAsk : prices?.yes;
-        }
-        lines.push(`📈 <b>Profit: ~${profitPct.toFixed(2)}%</b>  (buy ${sideLabel} @ ${buyPrice} → 1.00)`);
-    }
-
-    if (!result.resolved) {
-        const fExact = formatDate(result.estimatedEnd);
-        const fMin = formatDate(result.estimatedEndMin);
-        const fMax = formatDate(result.estimatedEndMax);
-        if (fExact) {
-            lines.push('');
-            lines.push(`📅 ${fExact}`);
-        } else if (fMin && fMax && fMin !== fMax) {
-            lines.push('');
-            lines.push(`📅 ${fMin} – ${fMax}`);
-        } else if (fMin) {
-            lines.push('');
-            lines.push(`📅 ${fMin}`);
-        }
+    if (detail) {
+        lines.push(`💡 <i>${String(detail).slice(0, 100)}</i>`);
     }
 
     lines.push('');
@@ -1072,5 +933,35 @@ async function sendTelegramAlert(event, market, result, prices, profitPct) {
         }
     } catch (e) {
         log.warn('Telegram send error', e.message);
+    }
+}
+
+export async function sendRedeemNotification(event, market, side, won, pnl) {
+    if (!config.TELEGRAM_BOT_TOKEN || !config.TELEGRAM_CHAT_ID) return;
+
+    const icon = won ? '🏆' : '📉';
+    const lines = [
+        `${icon} <b>SETTLED: ${won ? 'WIN' : 'LOSS'}</b>`,
+        '',
+        `<b>${event?.title || 'Unknown event'}</b>`,
+        `${market?.question?.slice(0, 80) || ''}`,
+        '',
+        `Side: <b>${side}</b>`,
+        `P&L: <b>${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</b>`,
+    ];
+
+    try {
+        await fetch(`https://api.telegram.org/bot${config.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: config.TELEGRAM_CHAT_ID,
+                text: lines.join('\n'),
+                parse_mode: 'HTML',
+                disable_web_page_preview: true,
+            }),
+        });
+    } catch (e) {
+        log.warn('Telegram redeem notification error', e.message);
     }
 }

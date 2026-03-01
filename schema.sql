@@ -96,3 +96,35 @@ CREATE TABLE IF NOT EXISTS edge_predictions (
   updated_at timestamptz DEFAULT now(),
   UNIQUE(event_id, market_id)
 );
+
+-- Trades table (records every trade attempt and position)
+CREATE TABLE IF NOT EXISTS trades (
+  id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  event_id text NOT NULL,
+  market_id text NOT NULL,
+  market_question text,
+  side text NOT NULL,                     -- 'YES' or 'NO'
+  token_id text,                          -- CLOB token ID used
+  buy_price numeric(6,4) NOT NULL,
+  shares numeric(12,4),
+  amount_usd numeric(8,4) NOT NULL,
+  ai_probability numeric(6,4),
+  edge_pct numeric(6,4),
+  confidence int,
+  reasoning text,
+  status text NOT NULL DEFAULT 'pending', -- pending/filled/failed/dry_run
+  order_id text,                          -- CLOB order ID
+  fill_price numeric(6,4),
+  settled boolean DEFAULT false,
+  settled_outcome text,                   -- 'YES' or 'NO'
+  settled_at timestamptz,
+  pnl numeric(8,4),                       -- profit/loss in USD
+  redeemed boolean DEFAULT false,
+  redeemed_at timestamptz,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
+CREATE INDEX IF NOT EXISTS idx_trades_market ON trades(market_id);
+CREATE INDEX IF NOT EXISTS idx_trades_open ON trades(settled) WHERE settled = false AND status = 'filled';

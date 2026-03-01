@@ -3,6 +3,7 @@ import { config } from '../util/config.js';
 import { createLogger } from '../util/logger.js';
 import { getAllActiveTokenIds, getEventsByPolymarketIds } from '../db/supabase.js';
 import { checkAndProcessEvent } from './agent.js';
+import { handleMarketResolution } from '../trading/redeemer.js';
 const log = createLogger('ws');
 
 let _ws = null;
@@ -119,31 +120,21 @@ async function handleMessage(data, state) {
     const eventType = data.event_type;
 
     if (eventType === 'market_resolved') {
-        // Instant resolution — we know the winner immediately
         log.info(`WS RESOLVED: "${data.question?.slice(0, 60)}" → ${data.winning_outcome}`);
-        // Trigger alert via Telegram
+
+        // Trigger auto-redeem for any open positions on this market
+        try {
+            await handleMarketResolution(data, state);
+        } catch (e) {
+            log.warn(`WS auto-redeem failed: ${e.message}`);
+        }
+
+        // Also trigger edge check (market may still be tradable briefly)
         await triggerCheck(data.assets_ids?.[0], state, 'resolved');
         return;
     }
 
-    if (eventType === 'price_change' || eventType === 'last_trade_price') {
-        // Check if any price crossed the threshold
-        const changes = Array.isArray(data.changes) ? data.changes : [data];
-        for (const change of changes) {
-            const price = Number(change.price || change.last_trade_price || 0);
-            const tokenId = change.asset_id || data.asset_id;
-            if (tokenId) {
-                // High YES price: potential YES opportunity (or NO mispricing detection)
-                if (price >= config.PRICE_SPIKE_THRESHOLD) {
-                    await triggerCheck(tokenId, state, `price=${price}`);
-                }
-                // Low YES price (= high NO price): potential NO opportunity
-                else if (price <= (1 - config.PRICE_SPIKE_THRESHOLD) && price > 0) {
-                    await triggerCheck(tokenId, state, `NO-price=${(1 - price).toFixed(3)}`);
-                }
-            }
-        }
-    }
+    // Price changes are handled by the scheduled scanner — no spike triggers needed
 }
 
 async function triggerCheck(tokenId, state, reason) {

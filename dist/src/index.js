@@ -4,12 +4,14 @@ import { State } from './state.js';
 import { getDb } from './db/supabase.js';
 import { backfill } from './ingestion/backfill.js';
 import { startEventSyncer } from './ingestion/syncer.js';
-import { startResolutionAgent } from './detection/agent.js';
+import { startEdgeAgent } from './detection/agent.js';
 import { startPriceStream, stopPriceStream } from './detection/websocket.js';
+import { initTrading } from './trading/executor.js';
+import { startRedeemMonitor } from './trading/redeemer.js';
 const log = createLogger('main');
 async function main() {
-    log.info('Alpha Scanner starting...');
-    log.info(`Config: confidence=${config.MIN_CONFIDENCE}`);
+    log.info('Edge Scanner starting...');
+    log.info(`Config: edge=${config.EDGE_THRESHOLD * 100}% confidence=${config.MIN_CONFIDENCE} trade=$${config.TRADE_AMOUNT} trading=${config.TRADING_ENABLED ? 'LIVE' : 'DRY RUN'}`);
     if (process.env.LOG_LEVEL)
         setLogLevel(process.env.LOG_LEVEL);
     // Verify DB connection
@@ -32,16 +34,20 @@ async function main() {
     }
     // Phase 2: Start polling loops (await first full sync to clean stale events)
     await startEventSyncer(state);
-    // Phase 3: Start resolution agent (DB now has fresh closed flags)
-    startResolutionAgent(state);
-    // Phase 3b: Start real-time price stream (WebSocket)
+    // Phase 3a: Initialize trading client (optional, graceful if credentials missing)
+    await initTrading();
+    // Phase 3b: Start edge detection agent
+    startEdgeAgent(state);
+    // Phase 3c: Start real-time WebSocket (for settlement detection)
     startPriceStream(state);
+    // Phase 3d: Start auto-redeem monitor
+    startRedeemMonitor(state);
     // Phase 4: Periodic state persistence
     setInterval(() => state.persist(), config.STATE_PERSIST_INTERVAL);
-    // Phase 5: Status reporting (summary only, no per-event spam)
+    // Phase 5: Status reporting
     setInterval(() => {
         const s = state.stats();
-        log.info(`STATUS: events=${s.events} markets=${s.markets} tracked=${s.tracked} resolved=${s.resolved}`);
+        log.info(`STATUS: events=${s.events} markets=${s.markets} tracked=${s.tracked} resolved=${s.resolved} positions=${state.activePositions.size}`);
     }, config.STATUS_REPORT_INTERVAL);
     // Graceful shutdown
     const shutdown = () => {
@@ -52,7 +58,7 @@ async function main() {
     };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
-    log.info('Alpha Scanner running. All loops started.');
+    log.info('Edge Scanner running. All loops started.');
 }
 main().catch(err => {
     log.error('Fatal error', err);

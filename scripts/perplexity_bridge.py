@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["perplexity-webui-scraper"]
+# dependencies = ["perplexity-webui-scraper>=0.5.0"]
 # ///
 """
 Bridge script: Node.js calls this via child_process.
@@ -14,16 +14,16 @@ Server mode (--server):
 
 Event mode input:  { "mode": "event", "event_title": str, "event_description": str,
                      "end_date": str, "market_questions": [str, ...],
-                     "market_descriptions": [str, ...] (optional, resolution rules) }
-Event mode output: { "resolved": bool, "answer": str, "winning_market_index": int|null,
-                     "confidence": int, "estimated_end": str|null,
-                     "estimated_end_min": str|null, "estimated_end_max": str|null,
+                     "market_descriptions": [str, ...] (optional),
+                     "market_prices": [float, ...] (optional, current YES prices) }
+Event mode output: { "resolved": bool,
+                     "markets": [{"market": int, "probability_yes": 0-100, "confidence": 0-100}, ...],
                      "reasoning": str }
 
-Market mode input:  { "question": str, "description": str, "end_date": str }
-Market mode output: { "resolved": bool, "outcome": str, "confidence": int,
-                      "estimated_end": str|null, "estimated_end_min": str|null,
-                      "estimated_end_max": str|null, "reasoning": str }
+Market mode input:  { "question": str, "description": str, "end_date": str,
+                      "market_price": float (optional) }
+Market mode output: { "resolved": bool, "probability_yes": 0-100, "confidence": 0-100,
+                      "reasoning": str }
 """
 
 import json
@@ -138,60 +138,55 @@ def build_event_prompt(input_data):
     end_date = input_data.get("end_date", "")
     questions = input_data.get("market_questions", [])
     descriptions = input_data.get("market_descriptions", [])
+    prices = input_data.get("market_prices", [])
 
-    # Build market list with resolution rules when available
+    # Build market list with resolution rules and current prices
     mq_lines = []
     for i, q in enumerate(questions):
-        mq_lines.append(f"  {i+1}. {q}")
+        price_info = ""
+        if i < len(prices) and prices[i] is not None:
+            price_info = f" [Current market YES price: {prices[i]}]"
+        mq_lines.append(f"  {i+1}. {q}{price_info}")
         if i < len(descriptions) and descriptions[i]:
-            # Truncate very long descriptions to save tokens
             rule = descriptions[i][:500]
             mq_lines.append(f"     Resolution rules: {rule}")
     mq_list = "\n".join(mq_lines)
 
     return (
         f"Today is {_today()}.\n\n"
-        f"I need to determine the status of a prediction-market event and "
-        f"each of its individual markets.\n\n"
+        f"I need you to estimate the PROBABILITY of each market outcome "
+        f"based on current real-world evidence. This is for a prediction market "
+        f"event ending soon.\n\n"
         f"Event: {title}\n"
         f"Description: {desc or '(none)'}\n"
         f"Scheduled end: {end_date or '(none)'}\n\n"
         f"Markets:\n"
         f"{mq_list}\n\n"
-        f"Search for the latest news about this event.\n\n"
+        f"Search for the LATEST news, official statements, data, polls, "
+        f"expert analysis, and any relevant information about this event.\n\n"
         f"Rules:\n"
-        f"- READ each market's resolution rules carefully. Pay attention to "
-        f"exact dates, years, and what YES vs NO means for each market.\n"
-        f"- resolved=true ONLY if the outcome is officially confirmed "
-        f"(final score, winner declared, bill signed, official announcement). "
-        f"Predictions, polls, and forecasts do NOT count.\n"
-        f"- For EACH market, give outcome: \"yes\", \"no\", or \"unknown\".\n"
-        f"- If not resolved, find the EXACT time the outcome will be known "
-        f"(game end, vote result, announcement, deadline).\n"
-        f"  - estimated_end: EXACT datetime if known, else null\n"
-        f"  - If exact time is unknown, give a range:\n"
-        f"    - estimated_end_min: EARLIEST possible\n"
-        f"    - estimated_end_max: LATEST possible\n"
-        f"  - ALL datetimes must be UTC with seconds: YYYY-MM-DDTHH:MM:SSZ\n"
-        f"  - E.g. NBA game tips off 8pm ET → min=2026-02-21T03:00:00Z, max=2026-02-21T04:30:00Z\n"
-        f"  - E.g. bill vote Feb 25 2pm ET → exact=2026-02-25T19:00:00Z\n"
-        f"  - E.g. deadline end of March → exact=null, min/max=2026-03-31T23:59:59Z\n\n"
+        f"- For EACH market, estimate probability_yes (0-100): the percentage "
+        f"chance that YES wins.\n"
+        f"- Base your estimate on CONCRETE evidence: official statements, "
+        f"polls, expert analysis, historical patterns, recent developments.\n"
+        f"- Be well-calibrated: 50 = true toss-up, 80+ = strong evidence, "
+        f"95+ = near-certain.\n"
+        f"- If the event is ALREADY officially resolved, set resolved=true "
+        f"and probability_yes to 100 (YES won) or 0 (NO won).\n"
+        f"- confidence (0-100) = how confident you are in your probability "
+        f"estimate. High confidence means strong evidence exists.\n"
+        f"- DO NOT simply echo the market price. Form your OWN independent "
+        f"estimate from the evidence you find.\n\n"
         f"CRITICAL formatting rules:\n"
-        f"- answer: MAX 10 words. E.g. \"Team A won 3-1\" or "
-        f"\"Match starts Feb 22 at 8pm EST\" or \"No result yet, game tomorrow\"\n"
-        f"- reasoning: MAX 15 words. E.g. \"Official score confirmed on ESPN\" "
-        f"or \"Match scheduled for tomorrow per Liquipedia\"\n\n"
+        f"- reasoning: cite SPECIFIC evidence (max 30 words). "
+        f"E.g. \"Reuters reports bill passed Senate 52-48\" or "
+        f"\"Latest polls show 65% support, committee approved unanimously\"\n\n"
         f"Respond with ONLY raw JSON, no markdown fences:\n"
-        f'{{"resolved":true/false,'
-        f'"answer":"max 10 words",'
+        f'{{"resolved":false,'
         f'"markets":['
-        f'{{"market":1,"outcome":"yes/no/unknown","confidence":0-100}},'
+        f'{{"market":1,"probability_yes":0-100,"confidence":0-100}},'
         f'...],'
-        f'"confidence":0-100,'
-        f'"estimated_end":"YYYY-MM-DDTHH:MM:SSZ or null",'
-        f'"estimated_end_min":"YYYY-MM-DDTHH:MM:SSZ or null",'
-        f'"estimated_end_max":"YYYY-MM-DDTHH:MM:SSZ or null",'
-        f'"reasoning":"max 15 words"}}'
+        f'"reasoning":"cite specific evidence, max 30 words"}}'
     )
 
 
@@ -199,34 +194,31 @@ def build_market_prompt(input_data):
     question = input_data.get("question", "")
     description = input_data.get("description", "")
     end_date = input_data.get("end_date", "")
+    price = input_data.get("market_price", None)
+
+    price_info = f"\nCurrent market YES price: {price}" if price is not None else ""
 
     return (
         f"Today is {_today()}.\n\n"
-        f"I need to determine if this prediction-market question has an "
-        f"official result yet.\n\n"
+        f"I need you to estimate the probability that this prediction market "
+        f"question resolves YES, based on real-world evidence.\n\n"
         f"Question: {question}\n"
         f"Context: {description or '(none)'}\n"
-        f"Scheduled end: {end_date or '(none)'}\n\n"
-        f"Search for the latest news.\n\n"
+        f"Scheduled end: {end_date or '(none)'}\n"
+        f"{price_info}\n\n"
+        f"Search for the latest news, data, and analysis.\n\n"
         f"Rules:\n"
-        f"- resolved=true ONLY if the outcome is officially confirmed "
-        f"(final score, winner declared, official announcement). "
-        f"Predictions and forecasts do NOT count.\n"
-        f"- If not resolved, find the EXACT time the outcome will be known.\n"
-        f"  - estimated_end: exact datetime if known, else null\n"
-        f"  - If exact time unknown, give estimated_end_min and estimated_end_max\n"
-        f"  - ALL datetimes must be UTC with seconds: YYYY-MM-DDTHH:MM:SSZ\n\n"
-        f"CRITICAL formatting rules:\n"
-        f"- answer: MAX 10 words.\n"
-        f"- reasoning: MAX 15 words.\n\n"
+        f"- Estimate probability_yes (0-100): the chance YES wins.\n"
+        f"- Base on concrete evidence: official sources, polls, expert analysis.\n"
+        f"- Be calibrated: 50 = toss-up, 80+ = strong evidence, 95+ = near-certain.\n"
+        f"- If already officially resolved, set resolved=true and "
+        f"probability_yes to 100 (YES won) or 0 (NO won).\n"
+        f"- DO NOT simply echo the market price. Form your OWN estimate.\n\n"
         f"Respond with ONLY raw JSON, no markdown fences:\n"
-        f'{{"resolved":true/false,'
-        f'"outcome":"yes/no/unknown",'
+        f'{{"resolved":false,'
+        f'"probability_yes":0-100,'
         f'"confidence":0-100,'
-        f'"estimated_end":"YYYY-MM-DDTHH:MM:SSZ or null",'
-        f'"estimated_end_min":"YYYY-MM-DDTHH:MM:SSZ or null",'
-        f'"estimated_end_max":"YYYY-MM-DDTHH:MM:SSZ or null",'
-        f'"reasoning":"max 15 words"}}'
+        f'"reasoning":"cite specific evidence, max 30 words"}}'
     )
 
 

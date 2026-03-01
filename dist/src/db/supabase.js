@@ -331,3 +331,96 @@ export async function getActiveMarkets() {
     }
     return results;
 }
+
+// ─── Edge predictions ───
+
+export async function upsertEdgePrediction(row) {
+    const db = getDb();
+    const payload = { ...row, updated_at: new Date().toISOString() };
+    if (!payload.detected_at) payload.detected_at = new Date().toISOString();
+    const { data, error } = await db
+        .from('edge_predictions')
+        .upsert(payload, { onConflict: 'event_id,market_id' })
+        .select('id')
+        .single();
+    if (error) {
+        log.error(`upsert edge_prediction failed for ${row.market_id}`, error.message);
+        return null;
+    }
+    return data;
+}
+
+// ─── Trades ───
+
+export async function insertTrade(row) {
+    const db = getDb();
+    const payload = { ...row, created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
+    const { data, error } = await db
+        .from('trades')
+        .insert(payload)
+        .select('id')
+        .single();
+    if (error) {
+        log.error(`insertTrade failed for ${row.market_id}`, error.message);
+        return null;
+    }
+    return data;
+}
+
+export async function updateTradeStatus(tradeId, status, details = {}) {
+    const db = getDb();
+    const update = { status, updated_at: new Date().toISOString(), ...details };
+    const { error } = await db
+        .from('trades')
+        .update(update)
+        .eq('id', tradeId);
+    if (error) {
+        log.error(`updateTradeStatus ${tradeId} failed`, error.message);
+    }
+}
+
+export async function getOpenPositions() {
+    const db = getDb();
+    const { data, error } = await db
+        .from('trades')
+        .select('*')
+        .eq('status', 'filled')
+        .eq('settled', false);
+    if (error) {
+        log.error('getOpenPositions failed', error.message);
+        return [];
+    }
+    return data || [];
+}
+
+export async function markPositionSettled(tradeId, settledOutcome, pnl) {
+    const db = getDb();
+    const { error } = await db
+        .from('trades')
+        .update({
+            settled: true,
+            settled_outcome: settledOutcome,
+            settled_at: new Date().toISOString(),
+            pnl,
+            updated_at: new Date().toISOString(),
+        })
+        .eq('id', tradeId);
+    if (error) {
+        log.error(`markPositionSettled ${tradeId} failed`, error.message);
+    }
+}
+
+export async function markPositionRedeemed(tradeId) {
+    const db = getDb();
+    const { error } = await db
+        .from('trades')
+        .update({
+            redeemed: true,
+            redeemed_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+        })
+        .eq('id', tradeId);
+    if (error) {
+        log.error(`markPositionRedeemed ${tradeId} failed`, error.message);
+    }
+}
