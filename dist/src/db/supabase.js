@@ -384,7 +384,7 @@ export async function getOpenPositions() {
     const { data, error } = await db
         .from('trades')
         .select('*')
-        .eq('status', 'filled')
+        .in('status', ['filled', 'dry_run'])
         .eq('settled', false);
     if (error) {
         log.error('getOpenPositions failed', error.message);

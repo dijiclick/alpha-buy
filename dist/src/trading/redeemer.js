@@ -7,10 +7,8 @@ const log = createLogger('redeemer');
 const REDEEM_CHECK_INTERVAL = 5 * 60_000; // every 5 minutes
 
 export function startRedeemMonitor(state) {
-    if (!config.TRADING_ENABLED && !config.REDEEM_ENABLED) {
-        log.info('Auto-redeem disabled (neither TRADING_ENABLED nor REDEEM_ENABLED set)');
-        return;
-    }
+    // Settlement tracking always runs (for P&L scoring even in dry run mode)
+    // On-chain redemption only happens if REDEEM_ENABLED is set
 
     const check = async () => {
         try {
